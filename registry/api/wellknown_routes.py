@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from collections.abc import Iterable
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -45,6 +46,11 @@ OAUTH_DISCOVERY_CACHE_HEADERS: dict[str, str] = {
     "Cache-Control": "no-store",
     "Content-Type": "application/json",
 }
+
+# Registered-path prefix that identifies a virtual MCP server. Virtual servers
+# live in their own collection, so a PRM lookup for one of these paths must go
+# to the virtual-server service rather than the MCP-server repository.
+VIRTUAL_PATH_PREFIX: str = "/virtual/"
 
 
 @router.get("/ai-catalog.json")
@@ -271,6 +277,11 @@ def server_needs_per_server_prm(egress_auth_mode: str | None) -> bool:
     fine. Entra is the only provider that forces a per-server resource for plain
     servers, and the only one that incurs the per-connection-URL App ID URI
     registration cost.
+
+    The per-server PRM document's ``scopes_supported`` is likewise provider-
+    dependent: Entra advertises ``<resource>/user_impersonation``, every other
+    provider advertises ``derive_supported_scopes()`` (see
+    ``get_oauth_protected_resource_for_server``).
     """
     if egress_auth_mode == "obo_exchange":
         return True
@@ -287,6 +298,48 @@ def server_needs_per_server_prm(egress_auth_mode: str | None) -> bool:
     # auth-server's `_server_advertises_per_server_prm` (keep the two in sync).
     if entra_forces_per_server_prm(settings.auth_provider):
         return True
+    return False
+
+
+async def virtual_server_needs_per_server_prm(
+    backend_paths: Iterable[str],
+) -> bool:
+    """Whether a virtual server should advertise a per-server RFC 9728 PRM.
+
+    A virtual server has no ``egress_auth_mode`` of its own -- it aggregates
+    tools from backing servers -- but its ingress login is a gateway login
+    exactly like a registered server's, so it hits the same Entra resource and
+    scope alignment constraint. On Entra every server needs the per-server
+    resource (issue #990), virtual ones included: otherwise the 401 advertises
+    the bare-origin root PRM, whose resource Entra cannot match to an App ID URI
+    (AADSTS9010010), and whose OIDC-basics scopes it rejects (AADSTS70011). An
+    MCP client can then never complete the login for a ``/virtual/<id>`` path.
+
+    On a lenient IdP the bare origin works, so a per-server PRM is forced only
+    when a backing server's own egress mode already requires one -- today
+    ``obo_exchange``, whose ingress token must be audienced per-resource on any
+    provider. That keeps Keycloak/Cognito virtual servers on the gateway-wide
+    PRM, which is the path that works there (same reasoning as the
+    ``oauth_user`` carve-out in :func:`server_needs_per_server_prm`).
+
+    Args:
+        backend_paths: Registered paths of the virtual server's backing servers
+            (``tool_mappings[*].backend_server_path``, or the equivalent
+            ``backend_paths`` summary field).
+
+    Returns:
+        True when the per-server PRM should be served and advertised.
+
+    Raises:
+        Exception: A backing-server lookup failure propagates so the caller can
+            fail closed rather than silently advertising the wrong resource.
+    """
+    if entra_forces_per_server_prm(settings.auth_provider):
+        return True
+    for backend_path in sorted(set(backend_paths)):
+        info = await server_service.get_server_info(backend_path)
+        if info and server_needs_per_server_prm(info.get("egress_auth_mode")):
+            return True
     return False
 
 
@@ -373,6 +426,12 @@ async def get_oauth_protected_resource_for_server(
     the gateway-wide root PRM -- 404s here so the client falls back to the global
     PRM (unchanged behavior).
 
+    A ``/virtual/<id>`` path resolves against the virtual-server collection
+    instead, gated by :func:`virtual_server_needs_per_server_prm`. A virtual
+    server is an MCP connection endpoint like any other, so without this an
+    Entra client could not log in to one at all: it would fall back to the
+    bare-origin root PRM that Entra refuses.
+
     The advertised ``resource`` is the **per-server connection URL** (e.g.
     ``https://gw/github/mcp``). This is the ONLY value that satisfies all three
     constraints simultaneously:
@@ -391,30 +450,69 @@ async def get_oauth_protected_resource_for_server(
     no per-server env config. Lenient IdPs (Keycloak/Cognito/Okta/Auth0) do not
     hit these constraints; their plain servers keep using the gateway-wide PRM
     and this per-server PRM is what makes Entra ingress login work.
+
+    ``scopes_supported`` is provider-dependent. On Entra it is the per-resource
+    ``<resource>/user_impersonation`` scope (exposed on the gateway app). On every
+    other provider it is :func:`derive_supported_scopes`, the same IdP-universal
+    list the global PRM advertises (honouring ``MCP_ADVERTISED_SCOPES``), because
+    scope-validating IdPs such as Keycloak reject an unknown
+    ``<resource>/user_impersonation`` scope at the authorize endpoint with
+    ``invalid_scope`` (observed on Keycloak 26.2.0), which would block IDE login to
+    ``obo_exchange`` servers before the token exchange is ever reached. The
+    ``resource`` stays the per-server connection URL on all providers.
     """
     normalized = _normalize_prm_server_path(server_path)
-    # Server lookup is inside a guard: a repository/backend error on this
+    # Lookups are inside a guard: a repository/backend error on this
     # UNAUTHENTICATED endpoint must not surface as an unhandled 500 with a
     # traceback. Fail closed to a generic 502 (logged for operators).
     try:
-        info = await server_service.get_server_info(normalized)
+        if normalized.startswith(VIRTUAL_PATH_PREFIX):
+            from ..services.virtual_server_service import get_virtual_server_service
+
+            vs_config = await get_virtual_server_service().get_virtual_server(normalized)
+            # A disabled virtual server has no nginx location, so there is no 401
+            # for a client to discover from; keep it out of discovery entirely.
+            needs_prm = (
+                vs_config is not None
+                and vs_config.is_enabled
+                and await virtual_server_needs_per_server_prm(
+                    tm.backend_server_path for tm in vs_config.tool_mappings
+                )
+            )
+            # A virtual server's connection URL always carries the /mcp transport
+            # segment: virtual_router.lua owns the whole subtree and there is no
+            # per-entry append_mcp_path override to honour.
+            append_mcp = True
+        else:
+            info = await server_service.get_server_info(normalized)
+            needs_prm = info is not None and server_needs_per_server_prm(
+                info.get("egress_auth_mode")
+            )
+            append_mcp = info is not None and info.get("append_mcp_path") is not False
     except Exception:
-        logger.exception("Per-server PRM: server lookup failed for %s", normalized)
+        logger.exception("Per-server PRM: lookup failed for %s", normalized)
         raise HTTPException(
             status_code=502, detail="Could not build Protected Resource Metadata"
         ) from None
-    if not info or not server_needs_per_server_prm(info.get("egress_auth_mode")):
-        # No per-server PRM for this server -> client falls back to the global PRM.
+    if not needs_prm:
+        # No per-server PRM for this path -> client falls back to the global PRM.
         raise HTTPException(status_code=404, detail="no per-server resource metadata")
 
     # Per-server connection-URL resource: the only value that satisfies the
     # client's RFC 9728 §3.3 match, RFC 8707 canonicalization, and Entra's exact
     # App ID URI match simultaneously (see the docstring).
-    append_mcp = info.get("append_mcp_path") is not False
     resource = build_per_server_resource_url(
         settings.registry_url, normalized, append_mcp=append_mcp
     )
-    scopes_supported = [f"{resource}/user_impersonation"]
+    # Scope shape is IdP-specific. Entra needs the per-resource
+    # `<resource>/user_impersonation` scope. Every other IdP (e.g. Keycloak)
+    # validates requested scopes against its own registered set and refuses
+    # unknown ones with `invalid_scope` (issue #1971), so advertise the same
+    # IdP-universal list the global PRM does (honours MCP_ADVERTISED_SCOPES).
+    if entra_forces_per_server_prm(settings.auth_provider):
+        scopes_supported = [f"{resource}/user_impersonation"]
+    else:
+        scopes_supported = await derive_supported_scopes()
     enforce_https(resource, https_required=settings.mcp_https_required)
 
     try:

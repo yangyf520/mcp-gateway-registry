@@ -95,6 +95,16 @@ def _normalize_path(path: str) -> str:
     return _CONSECUTIVE_SLASHES.sub("/", normalized)
 
 
+def normalize_request_path(path: str) -> str:
+    """Public form of ``_normalize_path``: the canonical path nginx routes on.
+
+    EXPORTED for ``auth_server.server``, which must compare a raw
+    ``X-Original-URL`` against the location nginx selected on its normalized
+    ``$uri`` (decoded once, slashes merged, dot-segments resolved).
+    """
+    return _normalize_path(path)
+
+
 def _prepare_path(
     path: str,
     root_path: str = "",
@@ -227,6 +237,36 @@ API_PREFIX_TO_TYPE: tuple[tuple[str, ResourceType], ...] = (
 # EXPORTED — see comment on ``API_PREFIX_TO_TYPE``.
 MCP_TRANSPORT_SEGMENTS: frozenset[str] = frozenset({"mcp", "sse", "messages"})
 
+# Signed in place of a version id when a virtual mapping pins a version the
+# backend does not have. No mcp-proxy token is minted for it and every verifier
+# refuses it. EXPORTED: the nginx generator, /validate and both verifiers use it.
+INVALID_VERSION_SENTINEL: Final[str] = "__invalid_version__"
+
+
+def mcp_proxy_route_binding(claims: dict) -> tuple[str, bool] | None:
+    """The signed ``(version_id, virtual_backend)`` of an mcp-proxy token.
+
+    One definition for the auth-server verifier, the registry-side verifier and
+    the egress vend. A token minted before route binding existed carries neither
+    claim (an older auth-server replica during a rolling deploy); it is a direct,
+    active-version token, which is all such a replica could mint. Accepting it is
+    safe: the vend still requires its signed upstream to equal the active
+    version's exact registered URL. A token naming the invalid version, or with
+    only one of the two claims or a mistyped one, is malformed (None).
+    """
+    if "version_id" not in claims and "virtual_backend" not in claims:
+        return "", False
+    version_id = claims.get("version_id")
+    virtual_backend = claims.get("virtual_backend")
+    if (
+        not isinstance(version_id, str)
+        or version_id == INVALID_VERSION_SENTINEL
+        or not isinstance(virtual_backend, bool)
+    ):
+        return None
+    return version_id, virtual_backend
+
+
 # Registry API paths that resource-bound tokens must never be allowed to
 # reach, regardless of what resource they are bound to. A resource-bound
 # token that could hit /api/tokens/generate could mint new tokens (including
@@ -336,14 +376,15 @@ def classify_request_url(
         for prefix, resource_type in _PREFIX_TO_TYPE:
             if prefix.startswith("/api/") and path.startswith(prefix):
                 resource_id = path[len(prefix) :]
-                # Strip sub-paths like /toggle, /rate, /health — we want the
-                # top-level resource slug only. Agents and skills don't have
-                # nested MCP transport segments, so splitting on "/" and
-                # taking the first component is correct.
-                resource_id = resource_id.split("/", 1)[0]
-                resource_id = resource_id.rstrip("/")
+                # Strip sub-paths like /rate and /content. A skill is stored
+                # under /skills/<slug>, whereas its API route omits that
+                # prefix; preserve it so the classified ID matches mint-time
+                # normalization of the actual skill path.
+                resource_id = resource_id.split("/", 1)[0].rstrip("/")
                 if not resource_id:
                     return None
+                if resource_type is ResourceType.SKILL:
+                    resource_id = f"skills/{resource_id}"
                 return (resource_type, resource_id)
         # Any other /api/* path (tokens, admin, search, health, etc.) is
         # not a classifiable resource.
@@ -461,7 +502,10 @@ async def validate_user_can_bind_resource(
         accessible = user_context.get("accessible_servers") or []
         if _WILDCARD_ACCESS & set(accessible):
             return True
-        return normalized_id in accessible
+        return any(
+            isinstance(grant, str) and normalize_resource_id(grant) == normalized_id
+            for grant in accessible
+        )
 
     if rtype is ResourceType.VIRTUAL_SERVER:
         ui_permissions = user_context.get("ui_permissions") or {}

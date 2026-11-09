@@ -56,6 +56,7 @@ import logging
 import operator as _operator
 import os
 import re
+import ssl
 import sys
 import threading
 import time
@@ -71,13 +72,14 @@ from urllib.parse import (
     urlparse,
 )
 
-import httpx
-import mcp
+import certifi
+import httpx2
 import yaml
 from langchain_anthropic import ChatAnthropic
 from langchain_aws import ChatBedrock
 from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
+from mcp import Client
 from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamable_http_client
 from registry_client import (
@@ -95,8 +97,92 @@ logging.basicConfig(
 # Get logger
 logger = logging.getLogger(__name__)
 
+# The MCP SDK's own HTTP client defaults (mcp.shared._httpx_utils).
+SDK_DEFAULT_TIMEOUT_SECONDS: float = 30.0
+SDK_DEFAULT_SSE_READ_TIMEOUT_SECONDS: float = 300.0
+
 # Global registry client instance (initialized in main)
 registry_client: RegistryClient | None = None
+
+# Schemes the agent will dial. Anything else (file:, gopher:, data:) is refused.
+ALLOWED_REGISTRY_SCHEMES: tuple[str, ...] = ("http", "https")
+
+# A server path is a registry route such as "currenttime" or "mcpgw/mcp". The model
+# picks it per call, so it is restricted to characters that cannot change the host:
+# no scheme separator, no "@", no leading "//", no backslash, no percent escape.
+_SAFE_SERVER_PATH = re.compile(r"^[A-Za-z0-9._~/-]+$")
+
+
+class AgentConfigError(RuntimeError):
+    """The agent cannot act because its own configuration is missing or unusable."""
+
+
+def _configured_registry_base_url() -> str:
+    """Return the scheme and host of the registry URL set at startup.
+
+    The value comes from ``--mcp-registry-url``, never from the model, so a
+    prompt-injected instruction cannot move the request or the bearer token that
+    rides on it to another host.
+
+    Returns:
+        The base URL, for example ``https://mcpgateway.ddns.net``.
+
+    Raises:
+        AgentConfigError: If the URL was never set, has no host, or uses a scheme
+            outside ``ALLOWED_REGISTRY_SCHEMES``.
+    """
+    configured = agent_settings.registry_url
+    if not configured:
+        raise AgentConfigError(
+            "No registry URL is configured. Start the agent with "
+            "--mcp-registry-url so tool calls have a destination."
+        )
+
+    parsed = urlparse(configured)
+    if parsed.scheme not in ALLOWED_REGISTRY_SCHEMES:
+        raise AgentConfigError(
+            f"Registry URL scheme '{parsed.scheme}' is not supported. Use one of: "
+            f"{', '.join(ALLOWED_REGISTRY_SCHEMES)}."
+        )
+    if not parsed.netloc:
+        raise AgentConfigError(
+            f"Registry URL '{configured}' has no host. Pass a full URL such as "
+            "https://mcpgateway.ddns.net/mcpgw/mcp."
+        )
+
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def _safe_server_path(server_name: str) -> str:
+    """Reduce a model-supplied server name to a relative path on the registry.
+
+    ``urljoin`` honors an absolute URL in its second argument, so an unchecked
+    ``server_name`` of ``http://evil.example/x`` would replace the configured base
+    outright. Stripping leading slashes alone does not stop that.
+
+    Args:
+        server_name: The server path the model asked for, such as ``/currenttime``.
+
+    Returns:
+        The path with leading slashes removed.
+
+    Raises:
+        AgentConfigError: If the value could change the destination host, or holds
+            characters outside the safe set.
+    """
+    candidate = server_name.strip().lstrip("/")
+    if not candidate:
+        raise AgentConfigError("server_name is empty, so there is no server to call.")
+
+    if not _SAFE_SERVER_PATH.match(candidate):
+        raise AgentConfigError(
+            f"server_name '{server_name}' is not a plain registry path. Use a path "
+            "such as 'currenttime' or 'mcpgw/mcp'."
+        )
+    if ".." in candidate:
+        raise AgentConfigError(f"server_name '{server_name}' walks outside the registry path.")
+
+    return candidate
 
 
 class ProgressSpinner:
@@ -580,7 +666,6 @@ async def search_registry_tools(
 
 @tool
 async def invoke_mcp_tool(
-    mcp_registry_url: str,
     server_name: str,
     tool_name: str,
     arguments: dict[str, Any],
@@ -588,10 +673,12 @@ async def invoke_mcp_tool(
     auth_provider: str = None,
 ) -> str:
     """
-    Invoke a tool on an MCP server using the MCP Registry URL and server name.
+    Invoke a tool on an MCP server reached through the configured MCP Registry.
+
+    The registry URL comes from the agent's own configuration, not from the model.
+    Only the server path, tool name and arguments are chosen per call.
 
     Args:
-        mcp_registry_url: The URL of the MCP Registry
         server_name: The name of the MCP server to connect to
         tool_name: The name of the tool to invoke
         arguments: Dictionary containing the arguments for the tool
@@ -600,13 +687,20 @@ async def invoke_mcp_tool(
 
     Returns:
         The result of the tool invocation as a string
-    """
-    # Build server URL from registry URL and server name
-    parsed_url = urlparse(mcp_registry_url)
-    base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
 
-    # Remove leading slash from server_name if present
-    server_name_clean = server_name.lstrip("/")
+    Raises:
+        AgentConfigError: If the registry URL was never configured, or is not a
+            plain http/https URL with a host.
+    """
+    # Build the server URL from the CONFIGURED registry URL. Taking this from a
+    # tool parameter would let a prompt-injected instruction pick the host, and
+    # the bearer token added below would go with it.
+    base_url = _configured_registry_base_url()
+
+    # Strip the leading slash, and refuse anything that could move the request off
+    # base_url. urljoin honors an absolute URL here, so "http://evil.example/x"
+    # would replace the configured host outright.
+    server_name_clean = _safe_server_path(server_name)
     server_url = urljoin(base_url + "/", server_name_clean)
 
     # Build headers with authentication
@@ -698,18 +792,40 @@ def _add_egress_auth(
     return headers
 
 
+def _certifi_ssl_context() -> ssl.SSLContext:
+    """TLS trust for httpx2, which reads only the OS store; certifi is what httpx used."""
+    return ssl.create_default_context(cafile=certifi.where())
+
+
+def _sse_http_client(
+    headers: dict[str, str] | None = None,
+    timeout: httpx2.Timeout | None = None,
+    auth: httpx2.Auth | None = None,
+) -> httpx2.AsyncClient:
+    """The SDK's SSE client factory with certifi trust and the SDK's default timeouts."""
+    if timeout is None:
+        timeout = httpx2.Timeout(
+            SDK_DEFAULT_TIMEOUT_SECONDS, read=SDK_DEFAULT_SSE_READ_TIMEOUT_SECONDS
+        )
+    return httpx2.AsyncClient(
+        headers=headers,
+        timeout=timeout,
+        auth=auth,
+        verify=_certifi_ssl_context(),
+    )
+
+
 async def _invoke_via_sse(
     server_url: str,
     headers: dict[str, str],
     tool_name: str,
     arguments: dict[str, Any],
 ) -> str:
-    """Invoke tool via SSE transport."""
-    async with sse_client(server_url, headers=headers) as (read, write):
-        async with mcp.ClientSession(read, write) as session:
-            await session.initialize()
-            result = await session.call_tool(tool_name, arguments=arguments)
-            return _format_tool_response(result)
+    """Invoke tool via the HTTP+SSE transport, which only speaks the initialize handshake."""
+    transport = sse_client(server_url, headers=headers, httpx_client_factory=_sse_http_client)
+    async with Client(transport, mode="legacy") as client:
+        result = await client.call_tool(tool_name, arguments=arguments)
+        return _format_tool_response(result)
 
 
 async def _invoke_via_http(
@@ -718,16 +834,17 @@ async def _invoke_via_http(
     tool_name: str,
     arguments: dict[str, Any],
 ) -> str:
-    """Invoke tool via streamable HTTP transport."""
-    async with httpx.AsyncClient(headers=headers) as http_client:
-        async with streamable_http_client(
-            url=server_url,
-            http_client=http_client,
-        ) as (read, write, _):
-            async with mcp.ClientSession(read, write) as session:
-                await session.initialize()
-                result = await session.call_tool(tool_name, arguments=arguments)
-                return _format_tool_response(result)
+    """Invoke tool via streamable HTTP transport.
+
+    Client(mode="auto") speaks MCP 2026-07-28 to servers that support it and
+    falls back to the initialize handshake for older servers. The MCP SDK 2.x
+    takes headers only through its own httpx2 client.
+    """
+    async with httpx2.AsyncClient(headers=headers, verify=_certifi_ssl_context()) as http_client:
+        transport = streamable_http_client(server_url, http_client=http_client)
+        async with Client(transport, mode="auto") as client:
+            result = await client.call_tool(tool_name, arguments=arguments)
+            return _format_tool_response(result)
 
 
 def _format_tool_response(result: Any) -> str:
@@ -750,6 +867,11 @@ class AgentSettings:
     def __init__(self):
         self.auth_token: str | None = None
         self.region: str = "us-east-1"
+        # Set once from the command line at startup. invoke_mcp_tool reads the
+        # destination from here rather than taking it as a tool parameter, so a
+        # prompt-injected instruction cannot redirect the request (and the bearer
+        # token that rides on it) to a host the operator never configured.
+        self.registry_url: str | None = None
 
 
 agent_settings = AgentSettings()
@@ -952,6 +1074,16 @@ async def main():
 
     # Set up authentication
     agent_settings.auth_token = args.jwt_token
+
+    # Pin the tool destination before any tool can run. invoke_mcp_tool reads this
+    # instead of taking the URL from the model, so fail here rather than on the
+    # first tool call if the URL is unusable.
+    agent_settings.registry_url = args.mcp_registry_url
+    try:
+        _configured_registry_base_url()
+    except AgentConfigError as e:
+        logger.error(f"Cannot start: {e}")
+        return
 
     # Load server configuration
     global server_config

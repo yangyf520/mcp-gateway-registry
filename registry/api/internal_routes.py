@@ -53,6 +53,31 @@ def _get_repo():
     return repo
 
 
+@router.get("/internal/sessions/tool-block", status_code=200)
+async def get_backend_tool_block(
+    server_path: str,
+) -> dict[str, list[str]]:
+    """Return fresh blocked tool names for a registered backing server.
+
+    The caller groups virtual tools by their active server path. A missing
+    server or unreadable overrides fail closed, including on cache hits.
+    """
+    from registry.repositories.factory import get_server_repository
+
+    repo = get_server_repository()
+    if not server_path.startswith("/"):
+        raise HTTPException(status_code=400, detail="Invalid backend server path")
+    try:
+        if not await repo.get(server_path):
+            raise HTTPException(status_code=404, detail="Backend server not found")
+        return {"blocked_tools": sorted(await repo.get_blocked_tools(server_path))}
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Unable to read virtual backend tool block state")
+        raise HTTPException(status_code=503, detail="Tool block state unavailable") from None
+
+
 @router.post(
     "/internal/sessions/client",
     response_model=CreateClientSessionResponse,
@@ -137,7 +162,7 @@ async def get_backend_session(
     """Look up a backend session by compound key, bound to the caller.
 
     The session_key is '<client_session_id>:<backend_key>'.
-    Returns the backend_session_id if found, 404 otherwise.
+    Returns an initialized stateless state or backend session ID, 404 otherwise.
     Also bumps last_used_at atomically.
 
     The Lua router passes the authenticated user via the ``user_id`` query
@@ -159,16 +184,17 @@ async def get_backend_session(
 
     client_session_id, backend_key = parts
 
-    backend_session_id = await repo.get_backend_session(
+    backend_session = await repo.get_backend_session(
         client_session_id=client_session_id,
         backend_key=backend_key,
         user_id=user_id,
     )
 
-    if backend_session_id is None:
+    if backend_session is None:
         raise HTTPException(status_code=404, detail="Backend session not found")
 
-    return GetBackendSessionResponse(backend_session_id=backend_session_id)
+    backend_session_id, stateless = backend_session
+    return GetBackendSessionResponse(backend_session_id=backend_session_id, stateless=stateless)
 
 
 @router.put(
@@ -196,12 +222,16 @@ async def store_backend_session(
 
     client_session_id, backend_key = parts
 
+    if request.client_session_id != client_session_id:
+        raise HTTPException(status_code=400, detail="Client session ID does not match session key")
+
     await repo.store_backend_session(
         client_session_id=client_session_id,
         backend_key=backend_key,
         backend_session_id=request.backend_session_id,
         user_id=request.user_id,
         virtual_server_path=request.virtual_server_path,
+        stateless=request.stateless,
     )
 
     return {"status": "stored"}

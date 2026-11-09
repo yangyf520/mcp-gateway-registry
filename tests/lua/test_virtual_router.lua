@@ -1,9 +1,7 @@
--- Regression tests for the virtual MCP server router's tools/list aggregation
--- (PR #1634 / originally #1526). Covers the fixed behaviors:
---   * a failed backend falls back to its mapping-file metadata (complete list),
---   * a genuine empty tools array is a success, not a failure,
---   * truncated / malformed backend responses are failures,
---   * partial (fallback) results are NOT cached; fully-discovered results ARE.
+-- Regression tests for virtual MCP backend aggregation and session management.
+-- Covers discovery fallback, empty/truncated responses, per-user egress tools,
+-- stateless/stateful initialization, backend authorization before dispatch, and
+-- the HTTP status returned for a missing, unknown or unverifiable client session.
 --
 -- Run from the repo root with OpenResty's resty CLI (provides lua-cjson):
 --   resty tests/lua/test_virtual_router.lua
@@ -51,11 +49,85 @@ local dict = _new_dict()
 
 -- Programmable ngx.location.capture responses, keyed by backend location.
 local capture_responses = {}
+local capture_handler = nil
+local block_requests = 0
+local block_responses = {
+    ["/_internal/sessions/tool-block?server_path=%2Fok"] =
+        { status = 200, body = '{"blocked_tools":[]}' },
+    ["/_internal/sessions/tool-block?server_path=%2Fdown"] =
+        { status = 200, body = '{"blocked_tools":[]}' },
+    ["/_internal/sessions/tool-block?server_path=%2Fone"] =
+        { status = 200, body = '{"blocked_tools":[]}' },
+    ["/_internal/sessions/tool-block?server_path=%2Ftwo"] =
+        { status = 200, body = '{"blocked_tools":[]}' },
+    ["/_internal/sessions/tool-block?server_path=%2Falias"] =
+        { status = 200, body = '{"blocked_tools":[]}' },
+    ["/_internal/sessions/tool-block?server_path=%2Fgithub"] =
+        { status = 200, body = '{"blocked_tools":[]}' },
+    ["/_internal/sessions/tool-block?server_path=%2Fpersonal"] =
+        { status = 200, body = '{"blocked_tools":[]}' },
+    ["/_internal/sessions/tool-block?server_path=%2Fplain"] =
+        { status = 200, body = '{"blocked_tools":[]}' },
+    ["/_internal/sessions/tool-block?server_path=%2Fpat"] =
+        { status = 200, body = '{"blocked_tools":[]}' },
+    ["/_internal/sessions/tool-block?server_path=%2Fhealthy"] =
+        { status = 200, body = '{"blocked_tools":[]}' },
+    ["/_internal/sessions/tool-block?server_path=%2Frpc_error"] =
+        { status = 200, body = '{"blocked_tools":[]}' },
+    ["/_internal/sessions/tool-block?server_path=%2Foauth"] =
+        { status = 200, body = '{"blocked_tools":[]}' },
+    ["/_internal/sessions/tool-block?server_path=%2Foutage_egress"] =
+        { status = 200, body = '{"blocked_tools":[]}' },
+    ["/_internal/sessions/tool-block?server_path=%2Foutage_plain"] =
+        { status = 200, body = '{"blocked_tools":[]}' },
+    ["/_internal/sessions/tool-block?server_path=%2Ffine"] =
+        { status = 200, body = '{"blocked_tools":[]}' },
+}
+
+-- Backends that answer the router's server/discover probe as 2026-07-28 servers.
+-- Every other /_vs_backend_* location answers it like a legacy server
+-- (-32601), so tests that count backend traffic do not see the probe.
+local modern_backends = {}
+
+local function _is_discover_probe(loc, opts)
+    if loc:sub(1, 12) ~= "/_vs_backend" or type(opts) ~= "table" or type(opts.body) ~= "string" then
+        return false
+    end
+    local ok, request = pcall(cjson.decode, opts.body)
+    return ok and type(request) == "table" and request.method == "server/discover"
+end
 
 _G.ngx = {
+    ctx = {},
     shared = { virtual_server_map = dict },
     location = {
-        capture = function(loc, _opts) return capture_responses[loc] end,
+        capture = function(loc, opts)
+            if _is_discover_probe(loc, opts) and not modern_backends[loc] then
+                return { status = 200, body = '{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}' }
+            end
+            -- The probe's own backend grant check: answered here for legacy test
+            -- backends, so tests that count /validate calls see only theirs.
+            if loc:sub(1, 9) == "/_vs_auth" then
+                local backend = loc:gsub("^/_vs_auth_", "/_vs_backend_", 1)
+                local x_body = _G.ngx.req._headers["X-Body"]
+                if not modern_backends[backend]
+                    and _is_discover_probe(backend, { body = x_body }) then
+                    return { status = 200, header = { ["X-Internal-Token"] = "probe-signed" } }
+                end
+            end
+            if loc:find("/_internal/sessions/tool-block?", 1, true) == 1 then
+                block_requests = block_requests + 1
+                return block_responses[loc] or { status = 404, body = "" }
+            end
+            if capture_handler then
+                local response = capture_handler(loc, opts)
+                if response then return response end
+            end
+            if loc:sub(1, 9) == "/_vs_auth" then
+                return { status = 200, header = { ["X-Internal-Token"] = "signed" } }
+            end
+            return capture_responses[loc]
+        end,
     },
     -- Stateful request-header mock so tests can seed a client-supplied header
     -- and observe whether set_header overwrote it or clear_header removed it.
@@ -63,15 +135,32 @@ _G.ngx = {
         _headers = {},
         set_header = function(k, v) _G.ngx.req._headers[k] = v end,
         clear_header = function(k) _G.ngx.req._headers[k] = nil end,
+        get_headers = function() return _G.ngx.req._headers end,
+        read_body = function() end,
+        get_body_data = function() return _G.ngx.req._body end,
     },
+    escape_uri = function(s)
+        return (s:gsub("([^%w%-%.%_%~])", function(char)
+            return string.format("%%%02X", string.byte(char))
+        end))
+    end,
     log = function() end,
     ERR = 4,
     WARN = 5,
+    HTTP_GET = 2,
     HTTP_POST = 8,
-    var = { request_id = "0" },
+    HTTP_PUT = 16,
+    HTTP_DELETE = 32,
+    var = { request_id = "0", auth_user = "alice" },
     status = 200,
-    say = function() end,
+    say = function(body) _G.ngx._last_body = body; _G.ngx._reply = body end,
     exit = function() end,
+    print = function(body) _G.ngx._last_body = body end,
+    header = {},
+    -- Controllable clock: tests advance _now to simulate a slow initialize.
+    _now = 0,
+    now = function() return _G.ngx._now end,
+
 }
 
 -- Load the router with the test hook active; it returns the module table.
@@ -91,51 +180,78 @@ do
 end
 
 -- ---------------------------------------------------------------------------
-print("test: _fetch_backend_tools_list classifies responses correctly")
+print("test: _fetch_backend_list classifies every backend outcome the same way")
 do
-    -- success with tools
-    capture_responses["/loc"] = { status = 200,
-        body = cjson.encode({ result = { tools = { { name = "x" } } } }) }
-    local tools, ok = M._fetch_backend_tools_list("/loc", nil, "srv")
-    check(ok == true and #tools == 1, "200 + tools -> (tools, true)")
+    local function fetch(response, method, key)
+        capture_responses["/_vs_backend_loc"] = response
+        return M._fetch_backend_list("/_vs_backend_loc", method or "tools/list", key or "tools",
+            nil, "srv")
+    end
 
-    -- genuine empty list is success
-    capture_responses["/loc"] = { status = 200,
-        body = cjson.encode({ result = { tools = {} } }) }
-    tools, ok = M._fetch_backend_tools_list("/loc", nil, "srv")
-    check(ok == true and #tools == 0, "200 + empty tools -> ([], true)")
+    local outcome, items = fetch({ status = 200,
+        body = cjson.encode({ result = { tools = { { name = "x" } } } }) })
+    check(outcome == "ok" and #items == 1, "200 + tools -> ok with items")
 
-    -- http error is failure
-    capture_responses["/loc"] = { status = 500, body = "" }
-    tools, ok = M._fetch_backend_tools_list("/loc", nil, "srv")
-    check(ok == false, "500 -> (_, false)")
+    outcome, items = fetch({ status = 200, body = cjson.encode({ result = { tools = {} } }) })
+    check(outcome == "ok" and #items == 0, "200 + empty tools -> ok, empty")
 
-    -- truncated is failure
-    capture_responses["/loc"] = { status = 200, truncated = true,
-        body = cjson.encode({ result = { tools = { { name = "x" } } } }) }
-    tools, ok = M._fetch_backend_tools_list("/loc", nil, "srv")
-    check(ok == false, "truncated -> (_, false)")
+    capture_responses["/_vs_backend_loc"] = { status = 200,
+        header = { ["x-egress-consent-required"] = "pat" },
+        body = cjson.encode({ result = { resources = {} } }) }
+    outcome = M._fetch_backend_list("/_vs_backend_loc", "resources/list", "resources",
+        nil, "srv", true)
+    check(outcome == "consent", "broker consent marker (any header casing) -> consent")
 
-    -- missing tools array is failure
-    capture_responses["/loc"] = { status = 200, body = cjson.encode({ result = {} }) }
-    tools, ok = M._fetch_backend_tools_list("/loc", nil, "srv")
-    check(ok == false, "missing tools array -> (_, false)")
+    outcome = fetch({ status = 200, body = cjson.encode({
+        error = { code = -32601, message = "Method not found" } }) }, "prompts/list", "prompts")
+    check(outcome == "unsupported", "-32601 -> unsupported")
+
+    -- Only the gateway's grant check denies; the backend's own refusal is a
+    -- failure of that backend (a registrant must not be able to blank siblings).
+    outcome = fetch({ status = 200, body = cjson.encode({
+        error = { code = -32603, message = "Access denied" } }) })
+    check(outcome == "failed", "backend JSON-RPC access error -> failed")
+
+    outcome = fetch({ status = 403, body = "" })
+    check(outcome == "failed", "backend 403 -> failed")
+
+    capture_handler = function(loc)
+        if loc == "/_vs_auth_loc" then return { status = 403 } end
+    end
+    outcome = fetch(nil)
+    check(outcome == "denied", "gateway grant refusal -> denied")
+    capture_handler = nil
+
+    outcome = fetch({ status = 200, header = { ["X-Egress-Consent-Required"] = "pat" },
+        body = cjson.encode({ result = { tools = { { name = "x" } } } }) })
+    check(outcome == "ok", "consent marker from a plain backend is ignored")
+
+    outcome = fetch({ status = 500, body = "" })
+    check(outcome == "failed", "500 -> failed")
+
+    outcome = fetch({ status = 200, truncated = true,
+        body = cjson.encode({ result = { tools = { { name = "x" } } } }) })
+    check(outcome == "failed", "truncated -> failed")
+
+    outcome = fetch({ status = 200, body = cjson.encode({ result = {} }) })
+    check(outcome == "failed", "missing list key -> failed")
 end
 
 -- ---------------------------------------------------------------------------
 print("test: _handle_tools_list falls back per-backend and does NOT cache partial")
 do
-    dict._store["tools_enriched:srv1"] = nil
+    dict._store["tools_enriched::srv1:5:alice"] = nil
     local mapping = { required_scopes = nil, tools = {
-        { name = "live_tool", original_name = "live_tool", backend_location = "/ok",
-          inputSchema = { type = "object" } },
-        { name = "down_tool", original_name = "down_tool", backend_location = "/down",
+        { name = "live_tool", original_name = "live_tool", backend_location = "/_vs_backend_ok",
+          backend_server_path = "/ok", inputSchema = { type = "object" } },
+        { name = "down_tool", original_name = "down_tool", backend_location = "/_vs_backend_down",
+          backend_server_path = "/down",
           inputSchema = { type = "object" } },
     } }
     capture_responses = {}
-    capture_responses["/ok"] = { status = 200,
+    capture_responses["/_vs_backend_ok"] = { status = 200,
         body = cjson.encode({ result = { tools = { { name = "live_tool", description = "live" } } } }) }
-    capture_responses["/down"] = { status = 500, body = "" }
+    capture_responses["/_vs_backend_down"] = { status = 500, body = "" }
 
     local resp = M._handle_tools_list("1", mapping, "", nil, "srv1")
     local decoded = cjson.decode(resp)
@@ -143,27 +259,163 @@ do
     for _, t in ipairs(decoded.result.tools) do names[t.name] = true end
     check(names["live_tool"] == true, "live backend tool present")
     check(names["down_tool"] == true, "failed backend tool present via fallback")
-    check(dict._store["tools_enriched:srv1"] == nil, "partial/fallback result is NOT cached")
+    check(dict._store["tools_enriched::srv1:5:alice"] == nil, "partial/fallback result is NOT cached")
 end
 
 -- ---------------------------------------------------------------------------
+print("test: egress discovery failure never presents mapping-only tools as available")
+do
+    ngx.var.auth_user = "alice"
+    local mapping = { tools = { { name = "alias", original_name = "underlying",
+        backend_location = "/_vs_backend_no_consent", egress_auth_mode = "oauth" } } }
+    capture_handler = function(loc)
+        if loc == "/_vs_auth_no_consent" then
+            return { status = 200, header = { ["X-Internal-Token"] = "signed" } }
+        end
+        if loc == "/_vs_backend_no_consent" then
+            return { status = 401, body = "" }
+        end
+    end
+    local response = cjson.decode(M._handle_tools_list(1, mapping, "", nil, "no_consent"))
+    check(response.error ~= nil, "OAuth consent failure does not masquerade as discoverable tool")
+    check(dict:get("tools_enriched::no_consent:5:alice") == nil,
+        "OAuth consent failure is never cached")
+    capture_handler = nil
+end
+
+-- ---------------------------------------------------------------------------
+
 print("test: _handle_tools_list caches when every backend succeeds")
 do
-    dict._store["tools_enriched:srv2"] = nil
+    dict._store["tools_enriched::srv2:5:alice"] = nil
     local mapping = { required_scopes = nil, tools = {
-        { name = "live_tool", original_name = "live_tool", backend_location = "/ok",
-          inputSchema = { type = "object" } },
-        { name = "down_tool", original_name = "down_tool", backend_location = "/down",
+        { name = "live_tool", original_name = "live_tool", backend_location = "/_vs_backend_ok",
+          backend_server_path = "/ok", inputSchema = { type = "object" } },
+        { name = "down_tool", original_name = "down_tool", backend_location = "/_vs_backend_down",
+          backend_server_path = "/down",
           inputSchema = { type = "object" } },
     } }
     capture_responses = {}
-    capture_responses["/ok"] = { status = 200,
+    capture_responses["/_vs_backend_ok"] = { status = 200,
         body = cjson.encode({ result = { tools = { { name = "live_tool" } } } }) }
-    capture_responses["/down"] = { status = 200,
+    capture_responses["/_vs_backend_down"] = { status = 200,
         body = cjson.encode({ result = { tools = { { name = "down_tool" } } } }) }
 
     M._handle_tools_list("1", mapping, "", nil, "srv2")
-    check(dict._store["tools_enriched:srv2"] ~= nil, "fully-discovered result IS cached")
+    check(dict._store["tools_enriched::srv2:5:alice"] ~= nil, "fully-discovered result IS cached")
+end
+
+-- Two different backends can both advertise the same original tool. A virtual
+-- mapping selects each tool by backend location, never by name alone.
+print("test: tools/list resolves overlapping upstream names once per mapped backend")
+do
+    dict._store["tools_enriched::overlap:5:alice"] = nil
+    local mapping = { tools = {
+        { name = "regions", original_name = "regions", backend_location = "/_vs_backend_one", backend_server_path = "/one" },
+        { name = "docs_alias", original_name = "docs", backend_location = "/_vs_backend_two", backend_server_path = "/two" },
+    } }
+    capture_responses["/_vs_backend_one"] = { status = 200, body = cjson.encode({ result = { tools = {
+        { name = "regions" }, { name = "docs" },
+    } } }) }
+    capture_responses["/_vs_backend_two"] = { status = 200, body = cjson.encode({ result = { tools = {
+        { name = "regions" }, { name = "docs" },
+    } } }) }
+    local listed = cjson.decode(M._handle_tools_list(5, mapping, "", nil, "overlap"))
+    check(#listed.result.tools == 2, "only two selected tools returned")
+    check(listed.result.tools[1].name == "regions" and listed.result.tools[2].name == "docs_alias",
+        "each mapping keeps its own displayed tool name")
+end
+
+-- Fully discovered metadata can stay cached, but its block decision cannot.
+print("test: tools/list hides a blocked tool immediately even with cached metadata")
+do
+    dict._store["tools_enriched::block-change:5:alice"] = nil
+    local mapping = { tools = {
+        { name = "docs_alias", original_name = "docs", backend_location = "/_vs_backend_backend-two.3av2",
+          backend_server_path = "/backend-two:v2", block_server_path = "/backend-two",
+          backend_version = "v2" },
+    } }
+    capture_responses["/_vs_backend_backend-two.3av2"] = { status = 200, body = cjson.encode({ result = { tools = {
+        { name = "docs" },
+    } } }) }
+    local uri = "/_internal/sessions/tool-block?server_path=%2Fbackend-two"
+    block_responses[uri] = { status = 200, body = '{"blocked_tools":[]}' }
+    local before = cjson.decode(M._handle_tools_list(1, mapping, "", nil, "block-change"))
+    check(#before.result.tools == 1, "tool is visible while unblocked")
+    check(dict._store["tools_enriched::block-change:5:alice"] ~= nil, "metadata is cached")
+    capture_responses["/_vs_backend_backend-two.3av2"] = { status = 503, body = "" }
+    block_responses[uri] = { status = 200, body = '{"blocked_tools":["docs"]}' }
+    local after = cjson.decode(M._handle_tools_list(2, mapping, "", nil, "block-change"))
+    check(#after.result.tools == 0, "cached pinned tool is hidden after base-server block")
+    block_responses[uri] = { status = 503, body = "" }
+    local failed = cjson.decode(M._handle_tools_list(3, mapping, "", nil, "block-change"))
+    check(failed.error and failed.error.code == -32603, "unreadable block state is an explicit error")
+    block_responses[uri] = nil
+end
+
+-- Two aliases on one backend incur one fresh block read per listing, even on
+-- cache hits; the blocked original name is removed without hiding its sibling.
+print("test: tools/list batches block checks by backing server")
+do
+    local uri = "/_internal/sessions/tool-block?server_path=%2Fok"
+    local mapping = { tools = {
+        { name = "first", original_name = "no_arg", backend_location = "/_vs_backend_ok",
+          backend_server_path = "/ok" },
+        { name = "second", original_name = "one_arg", backend_location = "/_vs_backend_ok",
+          backend_server_path = "/ok" },
+    } }
+    dict._store["tools_enriched::two-aliases:5:alice"] = nil
+    capture_responses["/_vs_backend_ok"] = { status = 200, body = cjson.encode({ result = { tools = {
+        { name = "no_arg" }, { name = "one_arg" },
+    } } }) }
+    block_requests = 0
+    local before = cjson.decode(M._handle_tools_list(1, mapping, "", nil, "two-aliases"))
+    check(#before.result.tools == 2 and block_requests == 1,
+        "two visible aliases require only one fresh block read")
+    block_responses[uri] = { status = 200, body = '{"blocked_tools":["one_arg"]}' }
+    local after = cjson.decode(M._handle_tools_list(2, mapping, "", nil, "two-aliases"))
+    check(#after.result.tools == 1 and after.result.tools[1].name == "first"
+        and block_requests == 2, "cached metadata rechecks one server and hides only blocked alias")
+    block_responses[uri] = { status = 200, body = '{"blocked_tools":[]}' }
+end
+
+-- A backend override is read at execution time. Stale/missing block state
+-- denies rather than routing an unsafe tool through the virtual server.
+print("test: tools/call rejects blocked or unreadable backend tool state")
+do
+    local mapping = { tools = { { name = "docs_alias", original_name = "docs",
+        backend_location = "/_vs_backend_backend-two.3av2", backend_server_path = "/backend-two:v2",
+        block_server_path = "/backend-two", backend_version = "v2", required_scopes = {} } },
+        tool_backend_map = { docs_alias = {
+            original_name = "docs", backend_location = "/_vs_backend_backend-two.3av2",
+            backend_server_path = "/backend-two:v2", block_server_path = "/backend-two",
+            backend_version = "v2",
+        } } }
+    local block_uri = "/_internal/sessions/tool-block?server_path=%2Fbackend-two"
+    block_responses[block_uri] = { status = 200, body = '{"blocked_tools":["docs"]}' }
+    ngx._reply = nil
+    M._handle_tools_call(1, mapping, { name = "docs_alias", arguments = {} }, "", nil, "overlap")
+    local blocked = cjson.decode(ngx._reply)
+    check(blocked.error and blocked.error.code == -32603
+        and blocked.error.message == "Access denied: backend tool blocked or unavailable",
+        "blocked original tool denied by canonical base path")
+    block_responses[block_uri] = { status = 503, body = "" }
+    ngx._reply = nil
+    M._handle_tools_call(2, mapping, { name = "docs_alias", arguments = {} }, "", nil, "overlap")
+    local unavailable = cjson.decode(ngx._reply)
+    check(unavailable.error and unavailable.error.code == -32603
+        and unavailable.error.message == "Access denied: backend tool blocked or unavailable",
+        "unavailable override state denied")
+    block_responses[block_uri] = nil
+    local wrong = { tools = { mapping.tools[1] }, tool_backend_map = { docs_alias = {
+        original_name = "docs", backend_location = "/_vs_backend_other",
+        backend_server_path = "/backend-two:v2", block_server_path = "/backend-two",
+        backend_version = "v2",
+    } } }
+    ngx._reply = nil
+    M._handle_tools_call(3, wrong, { name = "docs_alias" }, "", nil, "overlap")
+    check(cjson.decode(ngx._reply).error.message == "Inconsistent backend mapping for tool",
+        "tool alias cannot dispatch to a different backend after scope selection")
 end
 
 -- ---------------------------------------------------------------------------
@@ -209,16 +461,19 @@ do
         "nil auth_username clears the client-supplied X-Username")
 end
 
+ngx.var.auth_user = "alice"
+
+
 -- ---------------------------------------------------------------------------
 print("test: _handle_tools_list keeps empty schema arrays as [] (issue #1532)")
 do
-    dict._store["tools_enriched:srv3"] = nil
+    dict._store["tools_enriched::srv3:5:alice"] = nil
     local mapping = { required_scopes = nil, tools = {
-        { name = "no_arg", original_name = "no_arg", backend_location = "/ok" },
-        { name = "one_arg", original_name = "one_arg", backend_location = "/ok" },
+        { name = "no_arg", original_name = "no_arg", backend_location = "/_vs_backend_ok", backend_server_path = "/ok" },
+        { name = "one_arg", original_name = "one_arg", backend_location = "/_vs_backend_ok", backend_server_path = "/ok" },
     } }
     capture_responses = {}
-    capture_responses["/ok"] = { status = 200, body = cjson.encode({ result = { tools = {
+    capture_responses["/_vs_backend_ok"] = { status = 200, body = cjson.encode({ result = { tools = {
         { name = "no_arg", inputSchema = {
             type = "object", properties = {},
             required = setmetatable({}, cjson.empty_array_mt) } },
@@ -241,7 +496,7 @@ do
 
     -- The cached path decodes and re-encodes, so it must hold the same shape.
     local cached_body = M._handle_tools_list("1", mapping, "", nil, "srv3")
-    check(dict._store["tools_enriched:srv3"] ~= nil, "result was cached")
+    check(dict._store["tools_enriched::srv3:5:alice"] ~= nil, "result was cached")
     check(cached_body:find('"required":[]', 1, true) ~= nil,
         "empty required is still [] when served from cache")
 end
@@ -249,12 +504,12 @@ end
 -- ---------------------------------------------------------------------------
 print("test: a property named like a schema keyword stays an object")
 do
-    dict._store["tools_enriched:srv4"] = nil
+    dict._store["tools_enriched::srv4:5:alice"] = nil
     local mapping = { required_scopes = nil, tools = {
-        { name = "odd", original_name = "odd", backend_location = "/ok" },
+        { name = "odd", original_name = "odd", backend_location = "/_vs_backend_ok", backend_server_path = "/ok" },
     } }
     capture_responses = {}
-    capture_responses["/ok"] = { status = 200, body = cjson.encode({ result = { tools = {
+    capture_responses["/_vs_backend_ok"] = { status = 200, body = cjson.encode({ result = { tools = {
         { name = "odd", inputSchema = {
             type = "object", properties = { required = { type = "object" } } } },
     } } }) }
@@ -262,6 +517,1749 @@ do
     local body = M._handle_tools_list("1", mapping, "", nil, "srv4")
     check(body:find('"required":[]', 1, true) == nil,
         "a property called 'required' is not coerced into an array")
+end
+
+-- ---------------------------------------------------------------------------
+print("test: successful stateless initialize persists through L1 and L2")
+do
+    local initialized, lookups, puts, calls = 0, 0, 0, 0
+    local saved = nil
+    ngx.var.auth_user = "alice"
+    capture_handler = function(loc, opts)
+        if loc:find("/_internal/sessions/backend/", 1, true) == 1 then
+            if opts.method == ngx.HTTP_GET then
+                lookups = lookups + 1
+                return saved and { status = 200, body = saved } or { status = 404 }
+            end
+            if opts.method == ngx.HTTP_PUT then
+                puts = puts + 1
+                saved = opts.body
+                return { status = 200 }
+            end
+        end
+        if loc == "/_vs_auth_stateless" then
+            local method = cjson.decode(ngx.req._headers["X-Body"]).method
+            check(method == "initialize" or method == "tools/call",
+                "backend grant receives the rewritten RPC method")
+            check(opts.method == ngx.HTTP_GET, "backend grant uses GET /validate")
+            return { status = 200, header = { ["X-Internal-Token"] = "signed" } }
+        end
+        if loc == "/_vs_backend_stateless" then
+            local method = cjson.decode(opts.body).method
+            if method == "initialize" then
+                initialized = initialized + 1
+                return { status = 200, body = '{"jsonrpc":"2.0","result":{"capabilities":{}}}' }
+            end
+            calls = calls + 1
+            check(ngx.req._headers["Mcp-Session-Id"] == "", "stateless call has no session header")
+            return { status = 200, body = '{"jsonrpc":"2.0","result":{}}' }
+        end
+    end
+    M._proxy_to_backend(1, "tools/call", { name = "original" }, "/_vs_backend_stateless", "vs-a", "srv")
+    M._proxy_to_backend(2, "tools/call", { name = "original" }, "/_vs_backend_stateless", "vs-a", "srv")
+    check(initialized == 1 and calls == 2 and lookups == 1 and puts == 1,
+        "repeated calls reuse successful stateless initialization")
+    dict:delete("bsess_stateless:vs-a:/_vs_backend_stateless:5:alice")
+    M._proxy_to_backend(3, "tools/call", { name = "original" }, "/_vs_backend_stateless", "vs-a", "srv")
+    check(initialized == 1 and calls == 3 and lookups == 2,
+        "L2 stateless marker survives L1 expiration")
+    capture_handler = nil
+end
+
+-- ---------------------------------------------------------------------------
+print("test: failed initialize is retried, not cached as stateless")
+do
+    local initialized, calls = 0, 0
+    capture_handler = function(loc, opts)
+        if loc:find("/_internal/sessions/backend/", 1, true) == 1 then
+            return { status = 404 }
+        end
+        if loc == "/_vs_auth_failure" then
+            return { status = 200, header = { ["X-Internal-Token"] = "signed" } }
+        end
+        if loc == "/_vs_backend_failure" then
+            if cjson.decode(opts.body).method == "initialize" then
+                initialized = initialized + 1
+                return { status = 200, body = '{"jsonrpc":"2.0","error":{"code":-32000}}' }
+            end
+            calls = calls + 1
+        end
+    end
+    M._proxy_to_backend(1, "tools/call", {}, "/_vs_backend_failure", "vs-b", "srv")
+    M._proxy_to_backend(2, "tools/call", {}, "/_vs_backend_failure", "vs-b", "srv")
+    check(initialized == 2 and calls == 0, "failed initialize retries without calling tool")
+    check(dict:get("bsess_stateless:vs-b:/_vs_backend_failure:5:alice") == nil,
+        "failure has no stateless marker")
+    capture_handler = nil
+end
+
+-- ---------------------------------------------------------------------------
+print("test: stateful backend session reuses ID and refreshes stale session")
+do
+    local initialized, calls, deletes, ids = 0, 0, 0, {}
+    capture_handler = function(loc, opts)
+        if loc:find("/_internal/sessions/backend/", 1, true) == 1 then
+            if opts.method == ngx.HTTP_GET then return { status = 404 } end
+            if opts.method == ngx.HTTP_DELETE then deletes = deletes + 1 end
+            return { status = 200 }
+        end
+        if loc == "/_vs_auth_stateful" then
+            return { status = 200, header = { ["X-Internal-Token"] = "signed" } }
+        end
+        if loc == "/_vs_backend_stateful" then
+            if cjson.decode(opts.body).method == "initialize" then
+                initialized = initialized + 1
+                return { status = 200, header = { ["Mcp-Session-Id"] = "sid-" .. initialized },
+                    body = '{"jsonrpc":"2.0","result":{"capabilities":{}}}' }
+            end
+            calls = calls + 1
+            ids[calls] = ngx.req._headers["Mcp-Session-Id"]
+            if calls == 2 then return { status = 404, body = "" } end
+            return { status = 200, body = '{"jsonrpc":"2.0","result":{}}' }
+        end
+    end
+    M._proxy_to_backend(1, "tools/call", {}, "/_vs_backend_stateful", "vs-c", "srv")
+    M._proxy_to_backend(2, "tools/call", {}, "/_vs_backend_stateful", "vs-c", "srv")
+    check(initialized == 2 and calls == 3 and deletes == 1, "stale ID reinitializes once")
+    check(ids[1] == "sid-1" and ids[2] == "sid-1" and ids[3] == "sid-2",
+        "stateful calls use own backend session, then refreshed ID")
+    capture_handler = nil
+end
+
+print("test: null version also survives stateful session invalidation")
+do
+    local initialized, calls, deletes = 0, 0, 0
+    capture_handler = function(loc, opts)
+        if loc == "/_vs_auth_null_stale" then
+            return { status = 200, header = { ["X-Internal-Token"] = "signed" } }
+        end
+        if loc:find("/_internal/sessions/backend/", 1, true) == 1 then
+            if opts.method == ngx.HTTP_GET then return { status = 404 } end
+            if opts.method == ngx.HTTP_DELETE then deletes = deletes + 1 end
+            return { status = 200 }
+        end
+        if loc == "/_vs_backend_null_stale" then
+            if cjson.decode(opts.body).method == "initialize" then
+                initialized = initialized + 1
+                return { status = 200, header = { ["Mcp-Session-Id"] = "sid-" .. initialized },
+                    body = '{"jsonrpc":"2.0","result":{}}' }
+            end
+            calls = calls + 1
+            if calls == 1 then return { status = 404, body = "" } end
+            return { status = 200, body = '{"jsonrpc":"2.0","result":{}}' }
+        end
+    end
+    M._proxy_to_backend(1, "tools/call", { name = "get_me" },
+        "/_vs_backend_null_stale", "vs-null-stale", "srv", cjson.null)
+    check(initialized == 2 and calls == 2 and deletes == 1,
+        "null version reinitializes a rejected stateful backend session")
+    capture_handler = nil
+end
+
+-- ---------------------------------------------------------------------------
+print("test: backend sessions are isolated by selected version")
+do
+    local reads = 0
+    local selected_versions = {}
+    ngx.var.auth_user = "alice"
+    capture_handler = function(loc, opts)
+        if loc:find("/_internal/sessions/backend/", 1, true) == 1 then
+            if opts.method == ngx.HTTP_GET then
+                reads = reads + 1
+                return { status = 404 }
+            end
+            return { status = 200 }
+        end
+        if loc == "/_vs_auth_versioned" then
+            return { status = 200, header = { ["X-Internal-Token"] = "signed" } }
+        end
+        if loc == "/_vs_backend_versioned" then
+            if cjson.decode(opts.body).method == "initialize" then
+                selected_versions[#selected_versions + 1] = ngx.req._headers["X-MCP-Server-Version"]
+                return { status = 200,
+                    header = { ["Mcp-Session-Id"] = "sid-" .. selected_versions[#selected_versions] },
+                    body = '{"jsonrpc":"2.0","result":{}}' }
+            end
+            return { status = 200, body = '{"jsonrpc":"2.0","result":{}}' }
+        end
+    end
+    M._proxy_to_backend(1, "tools/call", {}, "/_vs_backend_versioned", "vs-d", "srv", "v1")
+    M._proxy_to_backend(2, "tools/call", {}, "/_vs_backend_versioned", "vs-d", "srv", "v2")
+    check(reads == 2 and selected_versions[1] == "v1" and selected_versions[2] == "v2",
+        "each pinned version has its own backend initialize and session")
+    capture_handler = nil
+end
+
+-- ---------------------------------------------------------------------------
+-- Session caches stay owner-scoped even if a valid-looking client session ID is
+-- supplied across identities. The owner-bound L2 query still protects a miss.
+do
+    local reads = 0
+    ngx.var.auth_user = "mallory"
+    capture_handler = function(loc, opts)
+        if loc:find("/_internal/sessions/backend/", 1, true) == 1 then
+            reads = reads + 1
+            check(loc:find("user_id=mallory", 1, true) ~= nil,
+                "backend L2 lookup is owner-scoped")
+            return { status = 404 }
+        end
+        if loc == "/_vs_auth_stateful" then return { status = 403 } end
+    end
+    local session_id, valid = M._get_backend_session("vs-c", "/_vs_backend_stateful", "srv")
+    check(session_id == nil and not valid and reads == 1,
+        "another user cannot use the cached stateful backend session")
+    capture_handler = nil
+end
+
+-- ---------------------------------------------------------------------------
+print("test: virtual alias dispatches original name to backing grant and upstream")
+do
+    local seen_auth, seen_backend = nil, nil
+    ngx.var.auth_user = "alice"
+    local mapping = { tool_backend_map = { alias = {
+        backend_location = "/_vs_backend_alias", backend_server_path = "/alias",
+        original_name = "underlying",
+    } }, tools = { { name = "alias", backend_location = "/_vs_backend_alias",
+        backend_server_path = "/alias", original_name = "underlying" } } }
+    capture_handler = function(loc, opts)
+        if loc == "/_vs_auth_alias" then
+            seen_auth = cjson.decode(ngx.req._headers["X-Body"]).params.name
+            return { status = 200, header = { ["X-Internal-Token"] = "signed" } }
+        end
+        if loc == "/_vs_backend_alias" then
+            seen_backend = cjson.decode(opts.body).params.name
+            return { status = 200, body = '{"jsonrpc":"2.0","result":{}}' }
+        end
+    end
+    ngx.req._headers["X-MCP-Server-Version"] = "client-selected"
+    M._handle_tools_call(1, mapping, { name = "alias" }, "", nil, "srv")
+    check(seen_auth == "underlying" and seen_backend == "underlying",
+        "backing grant and upstream see underlying tool, not virtual alias")
+    check(ngx.req._headers["X-MCP-Server-Version"] == nil,
+        "client-supplied backend version is removed when mapping is unpinned")
+    capture_handler = nil
+end
+
+-- An explicitly pinned alias selects its own auth and backend locations.
+print("test: pinned alias authorizes and calls the selected backend version")
+do
+    local auth_location, backend_location, seen_version
+    local mapping = { tools = { { name = "alias", original_name = "underlying",
+        backend_location = "/_vs_backend_github.3av2", backend_server_path = "/github:v2",
+        block_server_path = "/github", backend_version = "v2" } }, tool_backend_map = { alias = {
+        original_name = "underlying", backend_location = "/_vs_backend_github.3av2",
+        backend_server_path = "/github:v2", block_server_path = "/github", backend_version = "v2" } } }
+    capture_handler = function(loc, opts)
+        if loc == "/_vs_auth_github.3av2" then
+            auth_location = loc
+            check(cjson.decode(ngx.req._headers["X-Body"]).params.name == "underlying",
+                "pinned backend grant authorizes the original tool")
+            return { status = 200, header = { ["X-Internal-Token"] = "signed" } }
+        end
+        if loc == "/_vs_backend_github.3av2" then
+            backend_location = loc
+            seen_version = ngx.req._headers["X-MCP-Server-Version"]
+            return { status = 200, body = '{"jsonrpc":"2.0","result":{}}' }
+        end
+    end
+    ngx.req._headers["X-MCP-Server-Version"] = "client-selected"
+    M._handle_tools_call(2, mapping, { name = "alias" }, "", nil, "srv")
+    check(auth_location == "/_vs_auth_github.3av2"
+        and backend_location == "/_vs_backend_github.3av2" and seen_version == "v2",
+        "pin routes both grant and call through the versioned location")
+    capture_handler = nil
+end
+
+-- A mapping file written by json.dump uses null for an unpinned version.
+-- cjson decodes null as userdata, not Lua nil; it must not become a header
+-- or be used with the length operator when choosing the backend session key.
+print("test: unpinned JSON mapping call handles cjson.null version")
+do
+    local initialized, called = 0, 0
+    local mapping = cjson.decode('{"tool_backend_map":{"get_me":{"backend_location":"/_vs_backend_github","backend_server_path":"/github","original_name":"get_me","backend_version":null}},"tools":[{"name":"get_me","backend_location":"/_vs_backend_github","backend_server_path":"/github","original_name":"get_me"}]}')
+    capture_handler = function(loc, opts)
+        if loc == "/_vs_auth_github" then
+            return { status = 200, header = { ["X-Internal-Token"] = "signed" } }
+        end
+        if loc:find("/_internal/sessions/backend/", 1, true) == 1 then
+            if opts.method == ngx.HTTP_GET then return { status = 404 } end
+            return { status = 200 }
+        end
+        if loc == "/_vs_backend_github" then
+            if cjson.decode(opts.body).method == "initialize" then
+                initialized = initialized + 1
+            else
+                called = called + 1
+            end
+            return { status = 200, body = '{"jsonrpc":"2.0","result":{}}' }
+        end
+    end
+    ngx.req._headers["X-MCP-Server-Version"] = "caller-chosen"
+    M._handle_tools_call(1, mapping, { name = "get_me" }, "", "vs-null", "srv")
+    check(initialized == 1 and called == 1,
+        "null mapping version initializes and calls the unpinned backend")
+    check(ngx.req._headers["X-MCP-Server-Version"] == nil,
+        "null mapping version clears caller-selected version header")
+    capture_handler = nil
+end
+
+-- ---------------------------------------------------------------------------
+print("test: user-specific tools/list cache never crosses users or freezes consent")
+do
+    local requests, auths = 0, 0
+    local mapping = { tools = { { name = "alias", original_name = "underlying",
+        backend_location = "/_vs_backend_personal", backend_server_path = "/personal",
+        egress_auth_mode = "pat" } } }
+    capture_handler = function(loc, opts)
+        if loc == "/_vs_auth_personal" then
+            auths = auths + 1
+            return { status = 200, header = { ["X-Internal-Token"] = "signed" } }
+        end
+        if loc == "/_vs_backend_personal" then
+            requests = requests + 1
+            local name = ngx.var.auth_user == "alice" and "underlying" or "not-allowed"
+            return { status = 200, body = cjson.encode({ result = { tools = {
+                { name = name, description = ngx.var.auth_user },
+            } } }) }
+        end
+    end
+    ngx.var.auth_user = "alice"
+    local a = cjson.decode(M._handle_tools_list(1, mapping, "", nil, "personal"))
+    ngx.var.auth_user = "bob"
+    local b = cjson.decode(M._handle_tools_list(2, mapping, "", nil, "personal"))
+    check(a.result.tools[1].name == "alias" and a.result.tools[1].description == "alice",
+        "alias and original mapping preserved for first user")
+    check(#b.result.tools == 0 and requests == 2, "second user cannot see first user's tools")
+    ngx.var.auth_user = "alice"
+    M._handle_tools_list(3, mapping, "", nil, "personal")
+    check(requests == 3 and auths == 3,
+        "egress discovery never reuses cached metadata or backing grant")
+    ngx.var.auth_user = "bob"
+    M._handle_tools_list(4, mapping, "", nil, "personal")
+    check(requests == 4, "empty consent-like discovery is not cached")
+    capture_handler = nil
+end
+
+-- ---------------------------------------------------------------------------
+print("test: plain backend cache rechecks authorization and isolates principals")
+do
+    local calls, auths = 0, 0
+    local mapping = { tools = { { name = "alias", original_name = "underlying",
+        backend_location = "/_vs_backend_plain", backend_server_path = "/plain",
+        egress_auth_mode = "none" } } }
+    capture_handler = function(loc, opts)
+        if loc == "/_vs_auth_plain" then
+            auths = auths + 1
+            check(cjson.decode(ngx.req._headers["X-Body"]).method == "tools/list",
+                "plain cached discovery authorizes tools/list")
+            return { status = 200, header = { ["X-Internal-Token"] = "signed" } }
+        end
+        if loc == "/_vs_backend_plain" then
+            calls = calls + 1
+            return { status = 200, body = cjson.encode({ result = { tools = {
+                { name = "underlying", description = ngx.var.auth_user },
+            } } }) }
+        end
+    end
+    ngx.var.auth_user = "alice"
+    M._handle_tools_list(1, mapping, "", nil, "plain")
+    M._handle_tools_list(2, mapping, "", nil, "plain")
+    ngx.var.auth_user = "bob"
+    local response = cjson.decode(M._handle_tools_list(3, mapping, "", nil, "plain"))
+    check(calls == 2 and auths == 3,
+        "same user caches after reauthorization, new user fetches")
+    check(response.result.tools[1].description == "bob", "plain discovery never crosses users")
+    capture_handler = nil
+end
+
+-- ---------------------------------------------------------------------------
+print("test: denied backing grant never initializes or calls backend")
+do
+    local backend_calls = 0
+    ngx.var.auth_user = "alice"
+    capture_handler = function(loc)
+        if loc == "/_vs_auth_denied" then
+            check(cjson.decode(ngx.req._headers["X-Body"]).params.name == "underlying",
+                "backing grant checks original tool before initialize")
+            return { status = 403 }
+        end
+        if loc == "/_vs_backend_denied" then backend_calls = backend_calls + 1 end
+        if loc:find("/_internal/sessions/backend/", 1, true) == 1 then
+            return { status = 404 }
+        end
+    end
+    ngx.status = 200
+    M._proxy_to_backend(1, "tools/call", { name = "underlying" },
+        "/_vs_backend_denied", "vs-denied", "srv")
+    check(ngx.status == 403 and backend_calls == 0,
+        "denied backing grant prevents both initialize and tool call")
+    capture_handler = nil
+end
+
+-- ---------------------------------------------------------------------------
+print("test: a cold initialize reuses the request token only while it is fresh")
+do
+    local function call_after_initialize(client_session_id, initialize_seconds)
+        local auths, sent_token = 0, nil
+        ngx.var.auth_user = "alice"
+        capture_handler = function(loc, opts)
+            if loc == "/_vs_auth_slow" then
+                auths = auths + 1
+                return { status = 200, header = { ["X-Internal-Token"] = "tok-" .. auths } }
+            end
+            if loc:find("/_internal/sessions/backend/", 1, true) == 1 then
+                if opts and opts.method == ngx.HTTP_PUT then return { status = 200 } end
+                return { status = 404 }
+            end
+            if loc == "/_vs_backend_slow" then
+                local method = cjson.decode(opts.body).method
+                if method == "initialize" then
+                    ngx._now = ngx._now + initialize_seconds
+                    return { status = 200, header = { ["Mcp-Session-Id"] = "be-1" },
+                        body = cjson.encode({ jsonrpc = "2.0", id = 1, result = {} }) }
+                end
+                if method == "tools/call" then
+                    sent_token = ngx.req._headers["X-Internal-Token"]
+                end
+                return { status = 200, body = cjson.encode({ jsonrpc = "2.0", id = 1,
+                    result = { content = {} } }) }
+            end
+        end
+        ngx.status = 200
+        M._proxy_to_backend(1, "tools/call", { name = "underlying" },
+            "/_vs_backend_slow", client_session_id, "srv")
+        capture_handler = nil
+        return auths, sent_token
+    end
+
+    local auths, token = call_after_initialize("vs-fast", 0)
+    check(auths == 2 and token == "tok-1",
+        "fast initialize restores the pre-checked token (one extra /validate for initialize)")
+    auths, token = call_after_initialize("vs-slow", 10)
+    check(auths == 3 and token == "tok-3",
+        "slow initialize re-authorizes instead of sending a possibly expired token")
+end
+
+-- ---------------------------------------------------------------------------
+print("test: backend authorization denial blocks upstream and cached discovery")
+do
+    local upstream = 0
+    ngx.var.auth_user = "alice"
+    local mapping = { tools = { { name = "alias", original_name = "underlying",
+        backend_location = "/_vs_backend_blocked" } } }
+    dict:set("tools_enriched::blocked:5:alice", cjson.encode({ { name = "alias" } }))
+    ngx.req._headers["X-Internal-Token"] = "client-spoofed"
+    ngx.req._headers["X-Body-Uninspectable"] = "1"
+    capture_handler = function(loc)
+        if loc == "/_vs_auth_blocked" then
+            check(ngx.req._headers["X-Internal-Token"] == nil
+                and ngx.req._headers["X-Body-Uninspectable"] == nil,
+                "client auth metadata cleared before backend authorization")
+            return { status = 403 }
+        end
+        upstream = upstream + 1
+    end
+    local response = cjson.decode(M._handle_tools_list(1, mapping, "", nil, "blocked"))
+    check(response.error ~= nil and upstream == 0,
+        "cached tools are denied when backing grant is revoked")
+    capture_handler = nil
+end
+
+-- ---------------------------------------------------------------------------
+print("test: synthetic initialize cannot poison PAT backend session or mixed discovery")
+do
+    ngx.var.auth_user = "alice"
+    local consent = false
+    local initializes, puts, pat_puts, lists, calls = 0, 0, 0, 0, 0
+    local mapping = { tools = {
+        { name = "personal", original_name = "pat_tool",
+          backend_location = "/_vs_backend_pat", backend_server_path = "/pat",
+          egress_auth_mode = "pat" },
+        { name = "healthy", original_name = "public_tool",
+          backend_location = "/_vs_backend_healthy", backend_server_path = "/healthy" },
+    } }
+    capture_handler = function(loc, opts)
+        if loc:find("/_internal/sessions/backend/", 1, true) == 1 then
+            if opts.method == ngx.HTTP_GET then return { status = 404 } end
+            if opts.method == ngx.HTTP_PUT then
+                puts = puts + 1
+                if loc:find(":/_vs_backend_pat", 1, true) then
+                    pat_puts = pat_puts + 1
+                    check(cjson.decode(opts.body).backend_session_id == "real-session",
+                        "only a genuine PAT stateful initialize is persisted")
+                else
+                    check(cjson.decode(opts.body).stateless == true,
+                        "healthy backend persists its genuine stateless initialize")
+                end
+                return { status = 200 }
+            end
+        end
+        if loc == "/_vs_auth_pat" or loc == "/_vs_auth_healthy" then
+            return { status = 200, header = { ["X-Internal-Token"] = "signed" } }
+        end
+        if loc == "/_vs_backend_pat" then
+            local method = cjson.decode(opts.body).method
+            if method == "initialize" then
+                initializes = initializes + 1
+                if not consent then
+                    return { status = 200,
+                        header = { ["X-MCP-Backend-Initialized"] = "0",
+                            ["Mcp-Session-Id"] = "synthetic-not-backend" },
+                        body = '{"jsonrpc":"2.0","result":{"capabilities":{}}}' }
+                end
+                return { status = 200, header = { ["Mcp-Session-Id"] = "real-session" },
+                    body = '{"jsonrpc":"2.0","result":{"capabilities":{}}}' }
+            end
+            if method == "tools/list" then
+                lists = lists + 1
+                check(ngx.req._headers["Mcp-Session-Id"] == (consent and "real-session" or ""),
+                    "PAT list uses only a real backend session")
+                if not consent then
+                    -- The broker's pre-consent answer: an empty, marked list.
+                    return { status = 200, header = { ["x-egress-consent-required"] = "pat" },
+                        body = '{"jsonrpc":"2.0","result":{"tools":[]}}' }
+                end
+                return { status = 200,
+                    body = '{"jsonrpc":"2.0","result":{"tools":[{"name":"pat_tool"}]}}' }
+            end
+            calls = calls + 1
+            check(ngx.req._headers["X-Internal-Token"] == "signed"
+                and ngx.req._headers["Mcp-Session-Id"] == (consent and "real-session" or ""),
+                "PAT call carries fresh backing authorization and never synthetic session")
+            return { status = 200, body = consent
+                and '{"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"live"}]}}'
+                or '{"jsonrpc":"2.0","result":{"isError":true,"content":[{"type":"text","text":"Add a PAT in Connected Accounts"}]}}' }
+        end
+        if loc == "/_vs_backend_healthy" then
+            if cjson.decode(opts.body).method == "initialize" then
+                return { status = 200, body = '{"jsonrpc":"2.0","result":{}}' }
+            end
+            return { status = 200, body = '{"jsonrpc":"2.0","result":{"tools":[{"name":"public_tool"}]}}' }
+        end
+    end
+    for i = 1, 2 do
+        local response = cjson.decode(M._handle_tools_list(i, mapping, "", "vs-consent", "consent"))
+        local listed = {}
+        for _, tool in ipairs(response.result and response.result.tools or {}) do
+            listed[tool.name] = true
+        end
+        check(listed.healthy and listed.personal and #response.result.tools == 2,
+            "pre-consent PAT publishes its mapped tool beside healthy siblings")
+    end
+    check(initializes == 2 and lists == 2 and puts == 1 and pat_puts == 0
+        and dict:get("bsess_stateless:vs-consent:/_vs_backend_pat:5:alice") == nil,
+        "pre-consent PAT initializes again and never persists stateless state")
+    check(dict:get("bsess:vs-consent:/_vs_backend_pat:5:alice") == nil,
+        "synthetic initialize never caches a backend session ID")
+    check(dict:get("tools_enriched::consent:5:alice") == nil,
+        "mixed discovery with pre-consent empty tools is not cached")
+    local pat_only = { tools = { mapping.tools[1] } }
+    local pending = cjson.decode(M._handle_tools_list(3, pat_only, "", "vs-consent", "pat_only"))
+    check(pending.result and #pending.result.tools == 1
+        and pending.result.tools[1].name == "personal",
+        "PAT-only pre-consent tools/list advertises the tool that elicits the PAT")
+    check(dict:get("tools_enriched::pat_only:5:alice") == nil,
+        "empty pre-consent PAT discovery is never cached")
+    ngx.status = 200
+    M._handle_tools_call(3, { tools = mapping.tools, tool_backend_map = { personal = {
+        backend_location = "/_vs_backend_pat", backend_server_path = "/pat",
+        original_name = "pat_tool" } } },
+        { name = "personal" }, "", "vs-consent", "consent")
+    local pat_message = cjson.decode(ngx._last_body)
+    check(ngx.status == 200 and calls == 1 and pat_message.result.isError == true
+        and pat_message.result.content[1].text:find("Add a PAT", 1, true),
+        "PAT tool call before consent returns actionable mcp-proxy message")
+    consent = true
+    local response = cjson.decode(M._handle_tools_list(4, mapping, "", "vs-consent", "consent"))
+    local names = {}
+    for _, tool in ipairs(response.result.tools) do names[tool.name] = true end
+    check(names.personal and names.healthy and puts == 2 and pat_puts == 1,
+        "consent permits stateful initialize and both tools appear immediately")
+    M._proxy_to_backend(5, "tools/call", { name = "pat_tool" },
+        "/_vs_backend_pat", "vs-consent", "consent")
+    check(calls == 2 and initializes == 5 and lists == 4
+        and cjson.decode(ngx._last_body).result.content[1].text == "live",
+        "call after consent reuses genuine backend session and response")
+    capture_handler = nil
+end
+
+-- ---------------------------------------------------------------------------
+print("test: a plain backend's own errors and 403 fall back to mapping metadata")
+do
+    ngx.var.auth_user = "alice"
+    local mapping = { tools = { { name = "mapped", original_name = "actual",
+        backend_location = "/_vs_backend_rpc_error", backend_server_path = "/rpc_error",
+        inputSchema = { type = "object" } } } }
+    capture_responses["/_vs_backend_rpc_error"] = { status = 200,
+        body = '{"jsonrpc":"2.0","error":{"code":-32000,"message":"offline"}}' }
+    local response = cjson.decode(M._handle_tools_list(1, mapping, "", nil, "rpc_error"))
+    check(response.result and response.result.tools[1].name == "mapped",
+        "plain backend JSON-RPC failure retains mapping metadata")
+    check(dict:get("tools_enriched::rpc_error:5:alice") == nil,
+        "JSON-RPC error fallback is never cached")
+    capture_responses["/_vs_backend_rpc_error"] = { status = 403, body = "" }
+    response = cjson.decode(M._handle_tools_list(2, mapping, "", nil, "rpc_error"))
+    check(response.result and response.result.tools[1].name == "mapped"
+        and dict:get("tools_enriched::rpc_error:5:alice") == nil,
+        "a plain backend's own 403 is a backend failure: mapping fallback, never cached")
+end
+
+-- ---------------------------------------------------------------------------
+print("test: OAuth pre-consent returns connect URL; plain marker never reaches backend")
+do
+    ngx.var.auth_user = "alice"
+    local backend_calls, auths, writes = 0, 0, 0
+    local mapping = { tools = { { name = "alias", original_name = "upstream",
+        backend_location = "/_vs_backend_oauth", backend_server_path = "/oauth",
+        egress_auth_mode = "oauth_user" } },
+        tool_backend_map = { alias = { backend_location = "/_vs_backend_oauth",
+            backend_server_path = "/oauth", original_name = "upstream" } } }
+    capture_handler = function(loc, opts)
+        if loc == "/_vs_auth_oauth" or loc == "/_vs_auth_plain_marker" then
+            auths = auths + 1
+            local rpc = cjson.decode(ngx.req._headers["X-Body"])
+            check(rpc.method == "initialize" or rpc.method == "tools/call",
+                "both initialize and original tool are checked by backend grant")
+            return { status = 200, header = { ["X-Internal-Token"] = "signed" } }
+        end
+        if loc:find("/_internal/sessions/backend/", 1, true) == 1 then
+            if opts.method == ngx.HTTP_GET then return { status = 404 } end
+            if opts.method == ngx.HTTP_PUT then writes = writes + 1 end
+            return { status = 200 }
+        end
+        if loc == "/_vs_backend_oauth" or loc == "/_vs_backend_plain_marker" then
+            if cjson.decode(opts.body).method == "initialize" then
+                return { status = 200, header = { ["X-MCP-Backend-Initialized"] = "0" },
+                    body = '{"jsonrpc":"2.0","result":{"capabilities":{}}}' }
+            end
+            backend_calls = backend_calls + 1
+            return { status = 200, body = '{"jsonrpc":"2.0","error":{"code":-32042,'
+                .. '"data":{"elicitations":[{"mode":"url",'
+                .. '"url":"https://gateway.example/connect/oauth"}]}}}' }
+        end
+    end
+    ngx.status = 200
+    M._handle_tools_call(17, mapping, { name = "alias" }, "", "vs-oauth", "oauth")
+    local response = cjson.decode(ngx._last_body)
+    check(ngx.status == 200 and response.error.code == -32042
+        and response.error.data.elicitations[1].url == "https://gateway.example/connect/oauth"
+        and backend_calls == 1 and auths == 2 and writes == 0,
+        "OAuth tool returns proxy connect URL without caching synthetic session")
+    M._proxy_to_backend(18, "tools/call", { name = "upstream" },
+        "/_vs_backend_plain_marker", "vs-plain-marker", "plain")
+    check(ngx.status == 502 and backend_calls == 1 and writes == 0,
+        "unexpected pre-consent marker on plain backend fails closed")
+    capture_handler = nil
+end
+
+-- ---------------------------------------------------------------------------
+print("test: resource and prompt discovery separates backend outage from grant denial")
+do
+    local mapping = { tools = { { name = "mapped", backend_location = "/_vs_backend_discovery" } } }
+    local session_id = "vs-cafe"
+    local session_key = "csess_valid:alice:/virtual/discovery:" .. session_id
+    local backend_key = "bsess:" .. session_id .. ":/_vs_backend_discovery:5:alice"
+    dict:set("mapping::discovery", cjson.encode(mapping))
+    dict:set(session_key, "1")
+    ngx.var.virtual_server_id = "discovery"
+    ngx.var.http_mcp_session_id = session_id
+    ngx.var.request_method = "POST"
+    ngx.var.auth_user = "alice"
+    for _, entry in ipairs({
+        { list = "resources/list", get = "resources/read", params = { uri = "file://doc" } },
+        { list = "prompts/list", get = "prompts/get", params = { name = "draft" } },
+    }) do
+        for _, method in ipairs({ entry.list, entry.get }) do
+            ngx.req._body = cjson.encode({ jsonrpc = "2.0", id = 1, method = method,
+                params = entry.params })
+            -- The L2 backend session store is unavailable, but no grant was denied.
+            dict:delete(backend_key)
+            capture_handler = function(loc)
+                if loc == "/_vs_auth_discovery" then
+                    return { status = 200, header = { ["X-Internal-Token"] = "signed" } }
+                end
+                if loc:find("/_internal/sessions/backend/", 1, true) == 1 then
+                    return { status = 503 }
+                end
+            end
+            M.route()
+            check(ngx.status == 502 and cjson.decode(ngx._last_body).error.message
+                == "Backend discovery failed", method .. " returns backend error for session outage")
+
+            -- Once L2 reports a miss, initialize can fail independently.
+            capture_handler = function(loc, opts)
+                if loc == "/_vs_auth_discovery" then
+                    return { status = 200, header = { ["X-Internal-Token"] = "signed" } }
+                end
+                if loc:find("/_internal/sessions/backend/", 1, true) == 1
+                    and opts.method == ngx.HTTP_GET then return { status = 404 } end
+                if loc == "/_vs_backend_discovery" then return { status = 503 } end
+            end
+            M.route()
+            check(ngx.status == 502, method .. " reports backend initialize outage")
+            capture_handler = function(loc, opts)
+                if loc == "/_vs_auth_discovery" then
+                    return { status = cjson.decode(ngx.req._headers["X-Body"]).method
+                        == "initialize" and 403 or 200,
+                        header = { ["X-Internal-Token"] = "signed" } }
+                end
+                if loc:find("/_internal/sessions/backend/", 1, true) == 1
+                    and opts.method == ngx.HTTP_GET then return { status = 404 } end
+            end
+            M.route()
+            check(ngx.status == 403, method .. " preserves denied backend initialize grant")
+
+            capture_handler = function(loc)
+                if loc == "/_vs_auth_discovery" then return { status = 403 } end
+            end
+            M.route()
+            check(ngx.status == 403 and cjson.decode(ngx._last_body).error.message
+                == "Backend access denied", method .. " keeps genuine grant denial")
+
+            -- A healthy session can still reach a broken or denying backend.
+            dict:set(backend_key, "active-session")
+            capture_handler = function(loc)
+                if loc == "/_vs_auth_discovery" then
+                    return { status = 200, header = { ["X-Internal-Token"] = "signed" } }
+                end
+                if loc == "/_vs_backend_discovery" then return { status = 503 } end
+            end
+            M.route()
+            check(ngx.status == 502, method .. " treats backend HTTP 503 as outage")
+            capture_handler = function(loc)
+                if loc == "/_vs_auth_discovery" then
+                    return { status = 200, header = { ["X-Internal-Token"] = "signed" } }
+                end
+                if loc == "/_vs_backend_discovery" then return { status = 403 } end
+            end
+            M.route()
+            check(ngx.status == 502,
+                method .. " treats the backend's own HTTP 403 as an outage, not a grant denial")
+
+            -- A rejected stateful session retries initialize; classify its result.
+            for _, rejected in ipairs({
+                { status = 503, expected = 502 },
+                { status = 403, expected = 502 },
+            }) do
+                dict:set(backend_key, "stale-session")
+                local init_attempts, list_attempts = 0, 0
+                capture_handler = function(loc, opts)
+                    if loc == "/_vs_auth_discovery" then
+                        return { status = 200, header = { ["X-Internal-Token"] = "signed" } }
+                    end
+                    if loc:find("/_internal/sessions/backend/", 1, true) == 1 then
+                        if opts.method == ngx.HTTP_GET then return { status = 404 } end
+                        return { status = 200 }
+                    end
+                    if loc == "/_vs_backend_discovery" then
+                        if cjson.decode(opts.body).method == "initialize" then
+                            init_attempts = init_attempts + 1
+                            return { status = rejected.status }
+                        end
+                        list_attempts = list_attempts + 1
+                        return { status = 404 }
+                    end
+                end
+                M.route()
+                check(ngx.status == rejected.expected and init_attempts == 1
+                    and list_attempts == 1,
+                    method .. " classifies stale-session reinitialize " .. rejected.status)
+            end
+        end
+    end
+    capture_handler = nil
+end
+
+-- ---------------------------------------------------------------------------
+print("test: mixed resource/prompt discovery keeps live siblings before and after PAT")
+do
+    local connected, deny = false, false
+    local calls = {}
+    local mapping = { tools = {
+        { name = "pat", backend_location = "/_vs_backend_mix_pat", egress_auth_mode = "pat" },
+        { name = "unsupported", backend_location = "/_vs_backend_mix_unsupported" },
+        { name = "unavailable", backend_location = "/_vs_backend_mix_unavailable" },
+        { name = "healthy", backend_location = "/_vs_backend_mix_healthy" },
+    } }
+    local session_id = "vs-feed"
+    dict:set("mapping::mixed_resources", cjson.encode(mapping))
+    dict:set("csess_valid:alice:/virtual/mixed_resources:" .. session_id, "1")
+    ngx.var.virtual_server_id = "mixed_resources"
+    ngx.var.http_mcp_session_id = session_id
+    ngx.var.request_method = "POST"
+    ngx.var.auth_user = "alice"
+    capture_handler = function(loc, opts)
+        if loc:find("/_vs_auth_mix_", 1, true) == 1 then
+            if deny and loc == "/_vs_auth_mix_unsupported" then return { status = 403 } end
+            return { status = 200, header = { ["X-Internal-Token"] = "signed" } }
+        end
+        if loc:find("/_internal/sessions/backend/", 1, true) == 1 then
+            if opts.method == ngx.HTTP_GET then return { status = 404 } end
+            if opts.method == ngx.HTTP_PUT then
+                check(not loc:find("mix_pat", 1, true) or connected,
+                    "pre-consent PAT does not persist a synthetic session")
+            end
+            return { status = 200 }
+        end
+        local method = cjson.decode(opts.body).method
+        calls[loc .. ":" .. method] = (calls[loc .. ":" .. method] or 0) + 1
+        if method == "initialize" then
+            if loc == "/_vs_backend_mix_pat" and not connected then
+                return { status = 200, header = { ["X-MCP-Backend-Initialized"] = "0" },
+                    body = '{"jsonrpc":"2.0","result":{"capabilities":{}}}' }
+            end
+            if loc == "/_vs_backend_mix_unavailable" then return { status = 503 } end
+            return { status = 200, body = '{"jsonrpc":"2.0","result":{"capabilities":{}}}' }
+        end
+        if loc == "/_vs_backend_mix_pat" and not connected then
+            -- The broker answers a pre-consent list itself: empty, marked.
+            local key = method == "resources/list" and "resources" or "prompts"
+            return { status = 200, header = { ["x-egress-consent-required"] = "pat" },
+                body = cjson.encode({ result = { [key] = {} } }) }
+        end
+        if loc == "/_vs_backend_mix_unsupported" then
+            return { status = 200,
+                body = '{"jsonrpc":"2.0","error":{"code":-32601,"message":"Method not found"}}' }
+        end
+        if loc == "/_vs_backend_mix_healthy" or loc == "/_vs_backend_mix_pat" then
+            local owner = loc == "/_vs_backend_mix_pat" and "pat" or "healthy"
+            if method == "resources/list" then
+                return { status = 200, body = cjson.encode({ result = { resources = {
+                    { uri = "file://" .. owner } } } }) }
+            end
+            if method == "prompts/list" then
+                return { status = 200, body = cjson.encode({ result = { prompts = {
+                    { name = owner } } } }) }
+            end
+            return { status = 200, body = cjson.encode({ result = { owner = owner } }) }
+        end
+    end
+    for _, connected_now in ipairs({ false, true }) do
+        connected = connected_now
+        for _, entry in ipairs({
+            { list = "resources/list", get = "resources/read", key = "resources",
+                params = { uri = "file://healthy" } },
+            { list = "prompts/list", get = "prompts/get", key = "prompts",
+                params = { name = "healthy" } },
+        }) do
+            ngx.status = 200
+            ngx.req._body = cjson.encode({ jsonrpc = "2.0", id = 7, method = entry.list })
+            M.route()
+            local response = cjson.decode(ngx._last_body)
+            local items = response.result and response.result[entry.key] or {}
+            check(ngx.status == 200 and #items == (connected and 2 or 1),
+                entry.list .. " discovers only connected, healthy backends")
+            ngx.status = 200
+            ngx.req._body = cjson.encode({ jsonrpc = "2.0", id = 8,
+                method = entry.get, params = entry.params })
+            M.route()
+            response = cjson.decode(ngx._last_body)
+            check(ngx.status == 200 and response.result and response.result.owner == "healthy",
+                entry.get .. " resolves healthy backend despite failed siblings")
+            if connected then
+                ngx.status = 200
+                ngx.req._body = cjson.encode({ jsonrpc = "2.0", id = 9,
+                    method = entry.get, params = entry.key == "resources"
+                        and { uri = "file://pat" } or { name = "pat" } })
+                M.route()
+                response = cjson.decode(ngx._last_body)
+                check(ngx.status == 200 and response.result and response.result.owner == "pat",
+                    entry.get .. " reaches connected PAT backend")
+            end
+        end
+    end
+    check((calls["/_vs_backend_mix_unavailable:resources/list"] or 0) == 0
+        and dict:get("bsess_stateless:vs-feed:/_vs_backend_mix_pat:5:alice") ~= nil,
+        "unavailable backend is never listed; connected PAT gains real session")
+    -- The caller loses the grant for one backing server: that backend is
+    -- omitted, every sibling the caller can still use stays listed and readable.
+    deny = true
+    for _, method in ipairs({ "resources/list", "resources/read", "prompts/list", "prompts/get" }) do
+        ngx.status = 200
+        ngx.req._body = cjson.encode({ jsonrpc = "2.0", id = 10,
+            method = method, params = { uri = "file://healthy", name = "healthy" } })
+        M.route()
+        local response = cjson.decode(ngx._last_body)
+        local listed = response.result and (response.result.resources or response.result.prompts)
+        check(ngx.status == 200 and (listed and #listed == 2
+            or response.result and response.result.owner == "healthy"),
+            method .. " omits the denied backend and keeps healthy siblings")
+    end
+    -- Without any grant at all, the aggregate is a denial.
+    capture_handler = function(loc)
+        if loc:find("/_vs_auth_mix_", 1, true) == 1 then return { status = 403 } end
+    end
+    for _, method in ipairs({ "resources/list", "prompts/list" }) do
+        ngx.status = 200
+        ngx.req._body = cjson.encode({ jsonrpc = "2.0", id = 11, method = method })
+        M.route()
+        check(ngx.status == 403 and cjson.decode(ngx._last_body).error.message
+            == "Backend access denied", method .. " denies when no backing grant remains")
+    end
+    capture_handler = nil
+end
+
+-- ---------------------------------------------------------------------------
+print("test: backends that answered with nothing yield an empty list, not 502")
+do
+    ngx.var.auth_user = "alice"
+    local mapping = { tools = {
+        { name = "pat", backend_location = "/_vs_backend_none_pat", egress_auth_mode = "pat" },
+        { name = "unsupported", backend_location = "/_vs_backend_none_unsupported" },
+    } }
+    capture_handler = function(loc, opts)
+        if loc:find("/_vs_auth_none_", 1, true) == 1 then
+            return { status = 200, header = { ["X-Internal-Token"] = "signed" } }
+        end
+        if loc == "/_vs_backend_none_pat" then
+            return { status = 200, header = { ["x-egress-consent-required"] = "pat" },
+                body = cjson.encode({ result = { resources = {} } }) }
+        end
+        return { status = 200,
+            body = '{"jsonrpc":"2.0","error":{"code":-32601,"message":"Method not found"}}' }
+    end
+    local items, lookup, denied = M._proxy_list_to_backends("resources/list", "resources",
+        mapping, nil, "none")
+    check(items ~= nil and #items == 0 and lookup ~= nil and not denied,
+        "pre-consent plus unsupported backends aggregate to an empty list")
+    capture_handler = function(loc)
+        if loc:find("/_vs_auth_none_", 1, true) == 1 then
+            return { status = 200, header = { ["X-Internal-Token"] = "signed" } }
+        end
+        return { status = 503 }
+    end
+    items, lookup, denied = M._proxy_list_to_backends("resources/list", "resources",
+        mapping, nil, "none")
+    check(items == nil and not denied, "every backend failing is still a discovery failure")
+    capture_handler = nil
+end
+
+-- ---------------------------------------------------------------------------
+print("test: one credentialed backend outage keeps healthy sibling tools")
+do
+    local outage_status = 503
+    ngx.var.auth_user = "alice"
+    local mapping = { tools = {
+        { name = "brokered", original_name = "brokered", egress_auth_mode = "oauth_user",
+          backend_location = "/_vs_backend_outage_egress", backend_server_path = "/outage_egress",
+          inputSchema = { type = "object" } },
+        { name = "healthy", original_name = "healthy",
+          backend_location = "/_vs_backend_outage_plain", backend_server_path = "/outage_plain",
+          inputSchema = { type = "object" } },
+    } }
+    capture_handler = function(loc)
+        if loc:find("/_vs_auth_outage_", 1, true) == 1 then
+            return { status = 200, header = { ["X-Internal-Token"] = "signed" } }
+        end
+        if loc == "/_vs_backend_outage_egress" then return { status = outage_status } end
+        return { status = 200, body = cjson.encode({ result = { tools = { { name = "healthy" } } } }) }
+    end
+    local response
+    for _, status in ipairs({ 401, 403, 503 }) do
+        outage_status = status
+        response = cjson.decode(M._handle_tools_list(1, mapping, "", nil, "outage"))
+        check(response.result and #response.result.tools == 1
+            and response.result.tools[1].name == "healthy",
+            "credentialed backend " .. status .. ": healthy sibling stays listed, its tool hidden")
+    end
+    check(dict:get("tools_enriched::outage:5:alice") == nil, "partial result is not cached")
+    capture_handler = function(loc)
+        if loc:find("/_vs_auth_outage_", 1, true) == 1 then
+            return { status = 200, header = { ["X-Internal-Token"] = "signed" } }
+        end
+        if loc == "/_vs_backend_outage_egress" then return { status = 503 } end
+    end
+    local only_egress = { tools = { mapping.tools[1] } }
+    response = cjson.decode(M._handle_tools_list(2, only_egress, "", nil, "outage_only"))
+    check(response.error ~= nil, "a lone failed credentialed backend is still an error")
+    capture_handler = nil
+end
+
+-- ---------------------------------------------------------------------------
+print("test: mapping cache is partitioned by rendered config generation")
+do
+    dict:set("mapping:gen-old:gen_vs", cjson.encode({ tools = { { name = "stale" } } }))
+    ngx.var.vs_config_generation = "gen-new"
+    local mapping = M._get_mapping("gen_vs")
+    check(mapping == nil, "a mapping cached under the previous config is not served")
+    ngx.var.vs_config_generation = "gen-old"
+    mapping = M._get_mapping("gen_vs")
+    check(mapping and mapping.tools[1].name == "stale", "same generation still hits the cache")
+    ngx.var.vs_config_generation = nil
+end
+
+-- ---------------------------------------------------------------------------
+print("test: an auth-check failure is a backend failure, not a grant denial")
+do
+    ngx.var.auth_user = "alice"
+    for _, auth_response in ipairs({
+        { status = 429 }, { status = 504 }, { status = 200, header = {} },
+    }) do
+        capture_handler = function(loc)
+            if loc == "/_vs_auth_loc" then return auth_response end
+        end
+        local outcome = M._fetch_backend_list("/_vs_backend_loc", "tools/list", "tools",
+            nil, "srv")
+        check(outcome == "unverified", "auth check " .. auth_response.status
+            .. (auth_response.header and " without token" or "") .. " -> unverified")
+    end
+    local mapping = { tools = {
+        { name = "flaky", original_name = "flaky", backend_location = "/_vs_backend_flaky", backend_server_path = "/flaky" },
+        { name = "denied", original_name = "denied", backend_location = "/_vs_backend_nogrant", backend_server_path = "/nogrant" },
+        { name = "healthy", original_name = "healthy", backend_location = "/_vs_backend_fine", backend_server_path = "/fine" },
+    } }
+    capture_handler = function(loc)
+        if loc == "/_vs_auth_flaky" then return { status = 503 } end
+        if loc == "/_vs_auth_nogrant" then return { status = 403 } end
+        if loc == "/_vs_auth_fine" then
+            return { status = 200, header = { ["X-Internal-Token"] = "signed" } }
+        end
+        return { status = 200, body = cjson.encode({ result = { tools = { { name = "healthy" } } } }) }
+    end
+    local response = cjson.decode(M._handle_tools_list(1, mapping, "", nil, "mixed_auth"))
+    local names = {}
+    for _, tool in ipairs(response.result and response.result.tools or {}) do
+        names[tool.name] = true
+    end
+    check(names.healthy and not names.denied and not names.flaky,
+        "denied and unverified backends omitted (no mapping fallback), healthy sibling listed")
+    check(dict:get("tools_enriched::mixed_auth:5:alice") == nil, "partial result not cached")
+    ngx.status = 200
+    M._proxy_to_backend(2, "tools/call", { name = "flaky" }, "/_vs_backend_flaky", nil, "srv")
+    check(ngx.status == 502, "tools/call with a failing auth check is a retryable 502")
+    M._proxy_to_backend(3, "tools/call", { name = "denied" }, "/_vs_backend_nogrant", nil, "srv")
+    check(ngx.status == 403, "tools/call without the backing grant is still 403")
+    capture_handler = nil
+end
+
+-- ---------------------------------------------------------------------------
+print("test: a cached stateless marker re-initializes when the backend rejects it")
+do
+    ngx.var.auth_user = "alice"
+    dict:set("bsess_stateless:vs-flip:/_vs_backend_flip:5:alice", "1")
+    local inits, lists = 0, 0
+    capture_handler = function(loc, opts)
+        if loc == "/_vs_auth_flip" then
+            return { status = 200, header = { ["X-Internal-Token"] = "signed" } }
+        end
+        if loc:find("/_internal/sessions/backend/", 1, true) == 1 then
+            if opts.method == ngx.HTTP_GET then return { status = 404 } end
+            return { status = 200 }
+        end
+        if cjson.decode(opts.body).method == "initialize" then
+            inits = inits + 1
+            return { status = 200, header = { ["Mcp-Session-Id"] = "now-stateful" },
+                body = '{"jsonrpc":"2.0","result":{}}' }
+        end
+        lists = lists + 1
+        if ngx.req._headers["Mcp-Session-Id"] ~= "now-stateful" then
+            return { status = 400, body = "" }
+        end
+        return { status = 200, body = cjson.encode({ result = { tools = { { name = "t" } } } }) }
+    end
+    local outcome, items = M._fetch_backend_list("/_vs_backend_flip", "tools/list", "tools",
+        "vs-flip", "srv")
+    check(outcome == "ok" and #items == 1 and inits == 1 and lists == 2,
+        "stateless marker rejected with 400 -> one re-initialize, then success")
+    capture_handler = nil
+end
+
+-- ---------------------------------------------------------------------------
+print("test: resource reads reuse the caller's complete discovery, never another user's")
+do
+    local lists, reads = 0, 0
+    local mapping = { tools = {
+        { name = "a", backend_location = "/_vs_backend_docs" },
+    } }
+    capture_handler = function(loc, opts)
+        if loc == "/_vs_auth_docs" then
+            return { status = 200, header = { ["X-Internal-Token"] = "signed" } }
+        end
+        local method = cjson.decode(opts.body).method
+        if method == "resources/list" then
+            lists = lists + 1
+            return { status = 200, body = cjson.encode({ result = { resources = {
+                { uri = "file://" .. ngx.var.auth_user } } } }) }
+        end
+        reads = reads + 1
+        return { status = 200, body = cjson.encode({ result = { contents = {} } }) }
+    end
+    ngx.var.auth_user = "alice"
+    for i = 1, 2 do
+        ngx.status = 200
+        M._handle_resources_read(i, { uri = "file://alice" }, mapping, nil, "docs")
+    end
+    check(lists == 1 and reads == 2, "second read routes from the cached lookup")
+    ngx.var.auth_user = "bob"
+    ngx.status = 200
+    M._handle_resources_read(3, { uri = "file://alice" }, mapping, nil, "docs")
+    check(lists == 2 and reads == 2 and cjson.decode(ngx._last_body).error.code == -32601,
+        "another user rediscovers and cannot reach the first user's item")
+    -- The backend leaves the virtual server: a cached lookup must not route to it.
+    ngx.var.auth_user = "alice"
+    ngx.status = 200
+    M._handle_resources_read(4, { uri = "file://alice" }, { tools = {} }, nil, "docs")
+    check(reads == 2, "cached lookup naming an unmapped backend is never used")
+    capture_handler = nil
+end
+
+-- ---------------------------------------------------------------------------
+print("test: client session check separates malformed, unknown and unverifiable sessions")
+do
+    local session_id = "vs-5e55"
+    local cache_key = "csess_valid:alice:/virtual/session_check:" .. session_id
+    local validations, validation_status = 0, nil
+    capture_handler = function(loc)
+        if loc:find("/_internal/sessions/client/", 1, true) == 1 then
+            validations = validations + 1
+            return { status = validation_status }
+        end
+    end
+    ngx.var.virtual_server_id = "session_check"
+    ngx.var.request_method = "POST"
+    ngx.var.auth_user = "alice"
+    ngx.req._body = cjson.encode({ jsonrpc = "2.0", id = 1, method = "tools/list" })
+
+    -- A missing or malformed header never reaches the registry and stays 400.
+    for _, header in ipairs({ false, "not-a-session" }) do
+        ngx.var.http_mcp_session_id = header or nil
+        ngx.status = 200
+        M.route()
+        check(ngx.status == 400 and validations == 0,
+            "header " .. (header or "absent") .. " -> 400 without a registry lookup")
+    end
+
+    -- Unknown, expired, another user's or another server's session: the
+    -- registry answers 404 for all of them, and the client must re-initialize.
+    ngx.var.http_mcp_session_id = session_id
+    validation_status = 404
+    ngx.status = 200
+    M.route()
+    check(ngx.status == 404 and validations == 1
+        and cjson.decode(ngx._last_body).error.code == -32600,
+        "session unknown to the registry -> 404")
+    check(dict:get(cache_key) == nil, "a 404 is not cached as a valid session")
+
+    -- A failed check must not tell every client to re-initialize.
+    for _, status in ipairs({ 500, 502, 503, 403, 422 }) do
+        validation_status = status
+        ngx.status = 200
+        M.route()
+        check(ngx.status == 503 and cjson.decode(ngx._last_body).error.code == -32603,
+            "session check answering " .. status .. " -> 503")
+    end
+    check(dict:get(cache_key) == nil, "a failed check is not cached as a valid session")
+
+    -- A live session passes and is cached; an unknown method then reaches the
+    -- method dispatch, which answers 200 with a JSON-RPC "Method not found".
+    dict:set("mapping::session_check", cjson.encode({ tools = {} }))
+    ngx.req._body = cjson.encode({ jsonrpc = "2.0", id = 2, method = "session/check" })
+    validation_status = 200
+    ngx.status = 200
+    M.route()
+    check(ngx.status == 200 and cjson.decode(ngx._last_body).error.code == -32601
+        and dict:get(cache_key) == "1",
+        "session confirmed by the registry passes the check and is cached")
+    capture_handler = nil
+    ngx.var.http_mcp_session_id = nil
+end
+
+-- ---------------------------------------------------------------------------
+-- MCP 2026-07-28 clients: no initialize, no Mcp-Session-Id, headers mirror body.
+-- ---------------------------------------------------------------------------
+local MODERN_META = { ["io.modelcontextprotocol/protocolVersion"] = "2026-07-28",
+    ["io.modelcontextprotocol/clientInfo"] = { name = "t", version = "0" },
+    ["io.modelcontextprotocol/clientCapabilities"] = {} }
+
+local function modern_request(method, extra_params, headers)
+    local params = { _meta = MODERN_META }
+    for k, v in pairs(extra_params or {}) do params[k] = v end
+    ngx.req._body = cjson.encode({ jsonrpc = "2.0", id = 7, method = method, params = params })
+    ngx.var.http_mcp_protocol_version = "2026-07-28"
+    ngx.var.http_mcp_method = method
+    ngx.var.http_mcp_name = nil
+    ngx.var.http_mcp_session_id = nil
+    for k, v in pairs(headers or {}) do ngx.var[k] = v end
+    ngx.var.request_method = "POST"
+    ngx.var.auth_user = "alice"
+    ngx.status = 200
+    ngx.header = {}
+    ngx._last_body = nil
+end
+
+local function clear_modern_vars()
+    ngx.var.http_mcp_protocol_version = nil
+    ngx.var.http_mcp_method = nil
+    ngx.var.http_mcp_name = nil
+    ngx.var.http_mcp_session_id = nil
+end
+
+print("test: 2026-07-28 request classification")
+do
+    clear_modern_vars()
+    check(M._is_modern_request({ _meta = MODERN_META }) == true, "_meta version -> modern")
+    ngx.var.http_mcp_protocol_version = "2026-07-28"
+    check(M._is_modern_request({}) == true, "2026 header alone -> modern")
+    ngx.var.http_mcp_protocol_version = "2025-11-25"
+    check(M._is_modern_request({ protocolVersion = "2025-11-25" }) == false,
+        "legacy header and body -> legacy")
+    clear_modern_vars()
+    check(M._is_modern_request(nil) == false, "no params, no header -> legacy")
+end
+
+print("test: Mcp-Name base64 sentinel decoding")
+do
+    ngx.decode_base64 = function(s) return ({ ["ZWNobw=="] = "echo" })[s] end
+    check(M._decode_mcp_header_value("echo") == "echo", "plain value unchanged")
+    check(M._decode_mcp_header_value("=?base64?ZWNobw==?=") == "echo", "sentinel value decoded")
+    check(M._decode_mcp_header_value("=?base64??=") == "=?base64??=", "empty sentinel left as is")
+end
+
+print("test: 2026-07-28 header and version validation at the router")
+do
+    ngx.var.virtual_server_id = "modsrv"
+    local function err_code() return cjson.decode(ngx._last_body).error.code end
+
+    modern_request("tools/list", nil, { http_mcp_protocol_version = "" })
+    ngx.var.http_mcp_protocol_version = nil
+    M.route()
+    check(ngx.status == 400 and err_code() == -32020, "missing MCP-Protocol-Version -> 400 -32020")
+
+    modern_request("tools/list")
+    ngx.var.http_mcp_method = "tools/call"
+    M.route()
+    check(ngx.status == 400 and err_code() == -32020, "Mcp-Method mismatch -> 400 -32020")
+
+    modern_request("tools/call", { name = "ev_echo", arguments = {} },
+        { http_mcp_name = "something_else" })
+    M.route()
+    check(ngx.status == 400 and err_code() == -32020, "Mcp-Name mismatch -> 400 -32020")
+
+    modern_request("initialize", { protocolVersion = "2025-11-25" })
+    M.route()
+    check(ngx.status == 400 and err_code() == -32020,
+        "initialize with 2026-07-28 metadata -> 400 -32020")
+
+    local old = MODERN_META["io.modelcontextprotocol/protocolVersion"]
+    MODERN_META["io.modelcontextprotocol/protocolVersion"] = "1900-01-01"
+    modern_request("tools/list", nil, { http_mcp_protocol_version = "1900-01-01" })
+    ngx.var.http_mcp_protocol_version = "2026-07-28"
+    M.route()
+    check(ngx.status == 400 and err_code() == -32020, "header and _meta disagree -> 400 -32020")
+    modern_request("tools/list")
+    ngx.var.http_mcp_protocol_version = "1900-01-01"
+    ngx.req._body = cjson.encode({ jsonrpc = "2.0", id = 7, method = "tools/list",
+        params = { _meta = MODERN_META } })
+    M.route()
+    local body = cjson.decode(ngx._last_body)
+    check(ngx.status == 400 and body.error.code == -32022
+        and body.error.data.requested == "1900-01-01"
+        and body.error.data.supported[1] == "2026-07-28",
+        "unsupported version -> 400 -32022 with supported list")
+    MODERN_META["io.modelcontextprotocol/protocolVersion"] = old
+    clear_modern_vars()
+end
+
+print("test: server/discover and removed methods are answered by the router")
+do
+    ngx.var.virtual_server_id = "modsrv"
+    local session_posts = 0
+    capture_handler = function(loc, opts)
+        if loc == "/_internal/sessions/client" then session_posts = session_posts + 1 end
+    end
+    modern_request("server/discover")
+    M.route()
+    local body = cjson.decode(ngx._last_body)
+    check(ngx.status == 200 and body.result.supportedVersions[1] == "2026-07-28"
+        and body.result.resultType == "complete" and body.result.capabilities.tools ~= nil,
+        "server/discover -> DiscoverResult listing 2026-07-28")
+    check(ngx.header["Mcp-Session-Id"] == nil and session_posts == 0,
+        "server/discover mints no session and returns no Mcp-Session-Id")
+
+    modern_request("ping")
+    dict:set("mapping::modsrv", cjson.encode({ tools = {} }))
+    capture_handler = function(loc, opts)
+        if loc == "/_internal/sessions/client" then
+            return { status = 201, body = '{"client_session_id":"vs-feed01"}' }
+        end
+        if loc:find("/_internal/sessions/client/", 1, true) == 1 then return { status = 200 } end
+    end
+    M.route()
+    check(ngx.status == 404 and cjson.decode(ngx._last_body).error.code == -32601,
+        "ping (removed in 2026-07-28) -> 404 -32601")
+    capture_handler = nil
+    clear_modern_vars()
+end
+
+print("test: 2026-07-28 tools/list runs on a router-owned session without client headers")
+do
+    ngx.var.virtual_server_id = "modsrv"
+    dict._store["tools_enriched::modsrv:5:alice"] = nil
+    -- Start without a cached router-owned session (an earlier test made one).
+    for k, _ in pairs(dict._store) do
+        if k:find("modern_csess:", 1, true) == 1 or k:find("csess_valid:", 1, true) == 1 then
+            dict._store[k] = nil
+        end
+    end
+    dict:set("mapping::modsrv", cjson.encode({ tools = {
+        { name = "m_tool", original_name = "m_tool", backend_location = "/_vs_backend_m1",
+          backend_server_path = "/ok", inputSchema = { type = "object" } } } }))
+    local posts, seen_headers = 0, nil
+    local session_valid = true
+    capture_handler = function(loc, opts)
+        if loc == "/_internal/sessions/client" then
+            posts = posts + 1
+            return { status = 201, body = cjson.encode({ client_session_id = "vs-cafe0" .. posts }) }
+        end
+        if loc:find("/_internal/sessions/client/", 1, true) == 1 then
+            return { status = session_valid and 200 or 404 }
+        end
+        if loc:find("/_internal/sessions/backend/", 1, true) == 1 then
+            if opts.method == ngx.HTTP_GET then
+                return { status = 200, body = '{"stateless":true,"backend_session_id":null}' }
+            end
+            return { status = 200 }
+        end
+        if loc == "/_vs_backend_m1" then
+            local h = ngx.req._headers
+            seen_headers = { pv = h["MCP-Protocol-Version"], method = h["Mcp-Method"],
+                name = h["Mcp-Name"], param = h["Mcp-Param-Region"], sid = h["Mcp-Session-Id"] }
+            return { status = 200, body = cjson.encode({ result = { tools = { { name = "m_tool" } } } }) }
+        end
+    end
+    modern_request("tools/list")
+    ngx.req._headers = { ["MCP-Protocol-Version"] = "2026-07-28", ["Mcp-Method"] = "tools/list",
+        ["Mcp-Param-Region"] = "us-west1", ["Mcp-Session-Id"] = "client-supplied" }
+    M.route()
+    local body = cjson.decode(ngx._last_body)
+    check(ngx.status == 200 and body.result and body.result.tools[1].name == "m_tool",
+        "tools/list without a session reaches the backend and returns its tools")
+    check(posts == 1, "the router created one client session for the caller")
+    check(seen_headers and seen_headers.pv == nil and seen_headers.method == nil
+        and seen_headers.param == nil,
+        "the backend saw none of the client's 2026-07-28 headers")
+    check(seen_headers and seen_headers.sid ~= "client-supplied",
+        "the client's Mcp-Session-Id never reaches the backend")
+    check(ngx.header["Mcp-Session-Id"] == nil, "no session id is returned to a 2026-07-28 client")
+
+    dict._store["tools_enriched::modsrv:5:alice"] = nil
+    modern_request("tools/list")
+    M.route()
+    check(posts == 1, "a second request reuses the cached router-owned session")
+
+    -- The cached session expired in the registry: create a new one.
+    dict._store["tools_enriched::modsrv:5:alice"] = nil
+    for k, _ in pairs(dict._store) do
+        if k:find("csess_valid:", 1, true) == 1 then dict._store[k] = nil end
+    end
+    session_valid = false
+    modern_request("tools/list")
+    local original_handler = capture_handler
+    capture_handler = function(loc, opts)
+        local res = original_handler(loc, opts)
+        if loc == "/_internal/sessions/client" then session_valid = true end
+        return res
+    end
+    M.route()
+    check(posts == 2 and ngx.status == 200, "an expired router-owned session is replaced")
+
+    -- The session store is down: a clear 503, not a session error.
+    for k, _ in pairs(dict._store) do
+        if k:find("modern_csess:", 1, true) == 1 then dict._store[k] = nil end
+    end
+    capture_handler = function(loc)
+        if loc == "/_internal/sessions/client" then return { status = 503 } end
+    end
+    modern_request("tools/list")
+    M.route()
+    check(ngx.status == 503, "session store outage -> 503")
+    capture_handler = nil
+    ngx.req._headers = {}
+    clear_modern_vars()
+end
+
+print("test: a legacy request keeps today's header pass-through")
+do
+    ngx.req._headers = { ["MCP-Protocol-Version"] = "2025-11-25" }
+    clear_modern_vars()
+    check(M._is_modern_request({}) == false, "no 2026 markers -> legacy path")
+    -- The legacy path never calls _clear_client_mcp_headers.
+    check(ngx.req._headers["MCP-Protocol-Version"] == "2025-11-25",
+        "legacy client header is left for backend subrequests as before")
+    ngx.req._headers = {}
+end
+
+-- ---------------------------------------------------------------------------
+-- MCP 2026-07-28 backends: probed once, then called statelessly.
+-- ---------------------------------------------------------------------------
+local B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+ngx.encode_base64 = function(s)
+    return ((s:gsub(".", function(c)
+        local r, b = "", c:byte()
+        for i = 8, 1, -1 do r = r .. (b % 2 ^ i - b % 2 ^ (i - 1) > 0 and "1" or "0") end
+        return r
+    end) .. "0000"):gsub("%d%d%d?%d?%d?%d?", function(x)
+        if #x < 6 then return "" end
+        local c = 0
+        for i = 1, 6 do c = c + (x:sub(i, i) == "1" and 2 ^ (6 - i) or 0) end
+        return B64:sub(c + 1, c + 1)
+    end) .. ({ "", "==", "=" })[#s % 3 + 1])
+end
+
+print("test: Mcp-Name / Mcp-Param-* value encoding")
+do
+    check(M._encode_mcp_header_value("us-west1") == "us-west1", "plain string as is")
+    check(M._encode_mcp_header_value(42) == "42", "integer as decimal")
+    check(M._encode_mcp_header_value(true) == "true", "boolean as true")
+    check(M._encode_mcp_header_value(1.5) == nil, "non-integer number cannot be mirrored")
+    check(M._encode_mcp_header_value(" padded ") == "=?base64?IHBhZGRlZCA=?=", "whitespace -> base64")
+    check(M._encode_mcp_header_value("line1\nline2") == "=?base64?bGluZTEKbGluZTI=?=", "newline -> base64")
+    check(M._encode_mcp_header_value("=?base64?literal?=") == "=?base64?PT9iYXNlNjQ/bGl0ZXJhbD89?=",
+        "sentinel-shaped value -> base64")
+end
+
+print("test: x-mcp-header annotations follow the 2026-07-28 rules")
+do
+    local entries = M._x_mcp_header_entries({ type = "object", properties = {
+        region = { type = "string", ["x-mcp-header"] = "Region" },
+        opts = { type = "object", properties = { tenant = { type = "integer", ["x-mcp-header"] = "Tenant" } } },
+        list = { type = "array", items = { type = "object", properties = {
+            x = { type = "string", ["x-mcp-header"] = "Hidden" } } } },
+        plain = { type = "string" },
+    } })
+    local by_header = {}
+    for _, e in ipairs(entries or {}) do by_header[e.header] = table.concat(e.path, ".") end
+    check(by_header["Mcp-Param-Region"] == "region" and by_header["Mcp-Param-Tenant"] == "opts.tenant",
+        "top-level and nested properties chains are mirrored")
+    check(by_header["Mcp-Param-Hidden"] == nil, "a property under items (array) is not reachable")
+    check(M._x_mcp_header_entries({ properties = { n = { type = "number", ["x-mcp-header"] = "N" } } }) == nil,
+        "number parameters are invalid")
+    check(M._x_mcp_header_entries({ properties = {
+        a = { type = "string", ["x-mcp-header"] = "Dup" }, b = { type = "string", ["x-mcp-header"] = "dup" } } }) == nil,
+        "case-insensitive duplicates are invalid")
+    check(M._x_mcp_header_entries({ properties = { a = { type = "string", ["x-mcp-header"] = "Bad Name" } } }) == nil,
+        "non-token names are invalid")
+    local headers = M._param_headers(entries, { region = "eu", opts = { tenant = cjson.null } })
+    check(headers["Mcp-Param-Region"] == "eu" and headers["Mcp-Param-Tenant"] == nil,
+        "present values become headers; null and missing ones send none")
+end
+
+-- A capture handler for a 2026-07-28 backend at `loc` that records what it saw.
+local function modern_backend_handler(loc, seen, tools)
+    return function(l, opts)
+        if l == loc then
+            local request = cjson.decode(opts.body)
+            if request.method == "server/discover" then
+                return { status = 200, body = cjson.encode({ jsonrpc = "2.0", id = 1,
+                    result = { supportedVersions = { "2026-07-28" }, capabilities = {} } }) }
+            end
+            local h = ngx.req._headers
+            seen[#seen + 1] = { method = request.method, body = request, pv = h["MCP-Protocol-Version"],
+                mcp_method = h["Mcp-Method"], mcp_name = h["Mcp-Name"], region = h["Mcp-Param-Region"],
+                sid = h["Mcp-Session-Id"] }
+            if request.method == "tools/list" then
+                return { status = 200, body = cjson.encode({ result = { tools = tools or {} } }) }
+            end
+            return { status = 200, body = cjson.encode({ result = { resultType = "complete",
+                content = { { type = "text", text = "ok" } } } }) }
+        end
+        if l:find("/_internal/sessions/backend/", 1, true) == 1 then
+            seen.session_calls = (seen.session_calls or 0) + 1
+            return { status = 404 }
+        end
+    end
+end
+
+print("test: backend era is probed once and cached; failures are not cached")
+do
+    modern_backends["/_vs_backend_era_m"] = true
+    local seen = {}
+    local probes = 0
+    local handler = modern_backend_handler("/_vs_backend_era_m", seen)
+    capture_handler = function(l, opts)
+        if l == "/_vs_backend_era_m" and cjson.decode(opts.body).method == "server/discover" then
+            probes = probes + 1
+        end
+        return handler(l, opts)
+    end
+    check(M._backend_era("/_vs_backend_era_m", nil) == "modern", "a backend listing 2026-07-28 is modern")
+    check(M._backend_era("/_vs_backend_era_m", nil) == "modern" and probes == 1, "the era is cached after one probe")
+    check(M._backend_era("/_vs_backend_era_legacy", nil) == "legacy", "a -32601 answer means legacy")
+
+    modern_backends["/_vs_backend_era_fail"] = true
+    capture_handler = function(l)
+        if l == "/_vs_auth_era_fail" then return { status = 503 } end
+    end
+    check(M._backend_era("/_vs_backend_era_fail", nil) == "legacy"
+        and dict:get("bera:/_vs_backend_era_fail:") == nil,
+        "a probe that could not be authorized falls back without caching")
+    capture_handler = nil
+end
+
+print("test: a 2026-07-28 backend gets a stateless request with headers from the sent body")
+do
+    modern_backends["/_vs_backend_mod"] = true
+    local seen = {}
+    capture_handler = modern_backend_handler("/_vs_backend_mod", seen)
+    ngx.req._headers = { ["MCP-Protocol-Version"] = "2025-11-25" }
+    local body = cjson.encode({ jsonrpc = "2.0", id = 3, method = "tools/call",
+        params = { name = "get_weather", arguments = { region = "us-west1" } } })
+    local res, outcome = M._call_backend("/_vs_backend_mod", body, "vs-abc", "srv", nil, false,
+        { ["Mcp-Param-Region"] = "us-west1" })
+    local call = seen[1]
+    check(res and res.status == 200 and outcome == "ok", "the call reaches the modern backend")
+    check(call and call.method == "tools/call" and (seen.session_calls or 0) == 0,
+        "no initialize and no backend session for a modern backend")
+    check(call and call.body.params._meta["io.modelcontextprotocol/protocolVersion"] == "2026-07-28",
+        "the sent body carries the 2026-07-28 _meta")
+    check(call and call.pv == "2026-07-28" and call.mcp_method == "tools/call"
+        and call.mcp_name == "get_weather" and call.region == "us-west1",
+        "MCP-Protocol-Version, Mcp-Method, Mcp-Name and Mcp-Param-* match the sent body")
+    check(call and call.sid == nil, "no Mcp-Session-Id is sent to a modern backend")
+    check(ngx.req._headers["MCP-Protocol-Version"] == "2025-11-25" and ngx.req._headers["Mcp-Param-Region"] == nil
+        and ngx.req._headers["Mcp-Method"] == nil,
+        "request headers are restored, so a later legacy backend call sees none of them")
+    capture_handler = nil
+    ngx.req._headers = {}
+end
+
+print("test: tools/list from a 2026-07-28 backend drops invalid tools and feeds Mcp-Param-*")
+do
+    modern_backends["/_vs_backend_wx"] = true
+    local seen = {}
+    capture_handler = modern_backend_handler("/_vs_backend_wx", seen, {
+        { name = "forecast", inputSchema = { type = "object", properties = {
+            region = { type = "string", ["x-mcp-header"] = "Region" } } } },
+        { name = "broken", inputSchema = { type = "object", properties = {
+            n = { type = "number", ["x-mcp-header"] = "N" } } } },
+    })
+    local outcome, items = M._fetch_backend_list("/_vs_backend_wx", "tools/list", "tools", "vs-abc", "srv")
+    local names = {}
+    for _, tool in ipairs(items or {}) do names[#names + 1] = tool.name end
+    check(outcome == "ok" and #names == 1 and names[1] == "forecast",
+        "a tool with an invalid x-mcp-header is dropped from the list")
+
+    ngx.var.virtual_server_id = "wx"
+    dict:set("mapping::wx", cjson.encode({ tools = {
+        { name = "wx_forecast", original_name = "forecast", backend_location = "/_vs_backend_wx",
+          backend_server_path = "/fine" } },
+        tool_backend_map = { wx_forecast = { original_name = "forecast",
+            backend_location = "/_vs_backend_wx", backend_server_path = "/fine" } } }))
+    M._handle_tools_call(9, cjson.decode(dict:get("mapping::wx")),
+        { name = "wx_forecast", arguments = { region = "eu-north1" } }, "", "vs-abc", "wx")
+    local call = seen[#seen]
+    check(call and call.method == "tools/call" and call.body.params.name == "forecast"
+        and call.mcp_name == "forecast" and call.region == "eu-north1",
+        "tools/call to the alias sends the original name and the mirrored Mcp-Param-Region")
+    capture_handler = nil
+    ngx.req._headers = {}
+end
+
+print("test: backend lists are read across pages, and a failed page fails the fetch")
+do
+    local cursors, fail_page, endless = {}, nil, false
+    capture_handler = function(loc, opts)
+        if loc ~= "/_vs_backend_paged" then return nil end
+        local request = cjson.decode(opts.body)
+        local cursor = request.params and request.params.cursor or false
+        cursors[#cursors + 1] = cursor
+        local page = #cursors
+        if fail_page == page then return { status = 503 } end
+        local next_cursor = endless and "again" or ({ "c2", "c3", nil })[page]
+        return { status = 200, body = cjson.encode({ result = {
+            tools = { { name = "t" .. page } }, nextCursor = next_cursor } }) }
+    end
+    local outcome, items = M._fetch_backend_list("/_vs_backend_paged", "tools/list", "tools", nil, "srv")
+    check(outcome == "ok" and #items == 3 and items[3].name == "t3", "all three pages are merged")
+    check(cursors[1] == false and cursors[2] == "c2" and cursors[3] == "c3",
+        "each request passes back the previous page's nextCursor")
+
+    cursors, fail_page = {}, 2
+    outcome = M._fetch_backend_list("/_vs_backend_paged", "tools/list", "tools", nil, "srv")
+    check(outcome == "failed", "a failed second page fails the whole fetch")
+
+    cursors, fail_page, endless = {}, nil, true
+    outcome, items = M._fetch_backend_list("/_vs_backend_paged", "tools/list", "tools", nil, "srv")
+    check(outcome == "ok" and #cursors == 50 and #items == 50,
+        "a backend that never stops returning a cursor is read for at most 50 pages")
+    capture_handler = nil
+end
+
+print("test: a 2026-07-28 backend's 404 -32601 for a list means unsupported")
+do
+    capture_handler = function(loc)
+        if loc == "/_vs_backend_nores" then
+            return { status = 404, body = cjson.encode({ jsonrpc = "2.0", id = 1,
+                error = { code = -32601, message = "Method not found" } }) }
+        end
+        if loc == "/_vs_backend_gone" then return { status = 404, body = "not here" } end
+    end
+    check(M._fetch_backend_list("/_vs_backend_nores", "resources/list", "resources", nil, "srv")
+        == "unsupported", "404 with a JSON-RPC -32601 -> unsupported")
+    check(M._fetch_backend_list("/_vs_backend_gone", "resources/list", "resources", nil, "srv")
+        == "failed", "a 404 without a JSON-RPC error is still a failure")
+    capture_handler = nil
+end
+
+print("test: virtual tools/list keeps backend tool fields, also from its cache")
+do
+    dict._store["tools_enriched::fields:5:alice"] = nil
+    local mapping = { tools = {
+        { name = "alias_weather", original_name = "weather", backend_location = "/_vs_backend_fields",
+          backend_server_path = "/fine" } } }
+    capture_handler = function(loc)
+        if loc == "/_vs_backend_fields" then
+            return { status = 200, body = cjson.encode({ result = { tools = { {
+                name = "weather", title = "Weather", description = "Forecast",
+                inputSchema = { type = "object", properties = {} },
+                outputSchema = { type = "object", properties = { tags = { type = "array", default = {} } },
+                    required = setmetatable({}, cjson.empty_array_mt) },
+                annotations = { readOnlyHint = true }, icons = { { src = "https://x/i.png" } } } } } }) }
+        end
+    end
+    local first = cjson.decode(M._handle_tools_list(1, mapping, "", nil, "fields"))
+    local second_raw = M._handle_tools_list(2, mapping, "", nil, "fields")
+    local second = cjson.decode(second_raw)
+    for label, listed in pairs({ live = first, cached = second }) do
+        local tool = listed.result.tools[1]
+        check(tool and tool.name == "alias_weather" and tool.title == "Weather"
+            and tool.annotations.readOnlyHint == true and tool.icons[1].src == "https://x/i.png"
+            and tool.outputSchema.type == "object",
+            label .. " list keeps title, annotations, icons and outputSchema")
+    end
+    check(second_raw:find('"required":[]', 1, true) ~= nil,
+        "an empty outputSchema array stays an array after the cache round trip")
+    check(first.result.resultType == nil and first.result.cacheScope == nil,
+        "a legacy client gets no 2026-07-28 result fields")
+    dict._store["tools_enriched::fields:5:alice"] = nil
+    local modern = cjson.decode(M._handle_tools_list(3, mapping, "", nil, "fields", true))
+    check(modern.result.resultType == "complete" and modern.result.cacheScope == "private"
+        and modern.result.ttlMs == 60000,
+        "a 2026-07-28 client gets resultType, cacheScope private and ttlMs")
+    capture_handler = nil
+end
+
+print("test: resources/templates/list is aggregated across backends")
+do
+    local session_id = "vs-7e7"
+    dict:set("csess_valid:alice:/virtual/tpl:" .. session_id, "1")
+    dict:set("mapping::tpl", cjson.encode({ tools = {
+        { name = "a", backend_location = "/_vs_backend_tpl_a", backend_server_path = "/fine" },
+        { name = "b", backend_location = "/_vs_backend_tpl_b", backend_server_path = "/fine" } } }))
+    ngx.var.virtual_server_id = "tpl"
+    ngx.var.http_mcp_session_id = session_id
+    ngx.var.request_method = "POST"
+    ngx.var.auth_user = "alice"
+    ngx.req._body = cjson.encode({ jsonrpc = "2.0", id = 1, method = "resources/templates/list", params = {} })
+    capture_handler = function(loc, opts)
+        if loc:find("/_internal/sessions/backend/", 1, true) == 1 then
+            if opts.method == ngx.HTTP_GET then
+                return { status = 200, body = '{"stateless":true,"backend_session_id":null}' }
+            end
+            return { status = 200 }
+        end
+        if loc == "/_vs_backend_tpl_a" then
+            return { status = 200, body = cjson.encode({ result = { resourceTemplates = {
+                { uriTemplate = "file:///{path}", name = "files" } } } }) }
+        end
+        if loc == "/_vs_backend_tpl_b" then
+            return { status = 200, body = cjson.encode({ error = { code = -32601, message = "nope" } }) }
+        end
+    end
+    ngx.status = 200
+    M.route()
+    local body = cjson.decode(ngx._last_body)
+    check(ngx.status == 200 and body.result and #body.result.resourceTemplates == 1
+        and body.result.resourceTemplates[1].uriTemplate == "file:///{path}",
+        "templates from the supporting backend are listed; an unsupported backend is skipped")
+    capture_handler = nil
+    ngx.var.http_mcp_session_id = nil
+end
+
+-- ---------------------------------------------------------------------------
+print("inputSchema normalization keeps object schemas and their definitions")
+do
+    local nullable = M._ensure_mcp_schema({
+        type = { "object", "null" }, properties = { q = { type = "string" } },
+    })
+    check(nullable.type == "object" and nullable.properties.q.type == "string"
+        and nullable.properties.value == nil,
+        "a type list that allows an object is narrowed to object, not nested under value")
+
+    local ref_root = M._ensure_mcp_schema({
+        ["$ref"] = "#/$defs/Args", ["$defs"] = { Args = { type = "object" } },
+    })
+    check(ref_root.type == "object" and ref_root["$ref"] == "#/$defs/Args"
+        and ref_root["$defs"].Args ~= nil,
+        "a root $ref without a type keeps its reference and definitions")
+
+    local wrapped = M._ensure_mcp_schema({
+        type = "array", items = { ["$ref"] = "#/$defs/Item" },
+        ["$defs"] = { Item = { type = "string" } },
+    })
+    check(wrapped.type == "object" and wrapped.properties.value.type == "array"
+        and wrapped["$defs"] and wrapped["$defs"].Item.type == "string"
+        and wrapped.properties.value["$defs"] == nil,
+        "a wrapped non-object schema moves $defs to the new root so references resolve")
+
+    local plain = M._ensure_mcp_schema({ type = "object", properties = {} })
+    check(plain.type == "object", "an object schema is unchanged")
+end
+
+-- ---------------------------------------------------------------------------
+print("forwarded results gain resultType for 2026-07-28 clients")
+do
+    local json = M._with_modern_result_fields('{"jsonrpc":"2.0","id":3,"result":{"content":[],"isError":false}}', "tools/call")
+    local decoded = cjson.decode(json)
+    check(decoded.result.resultType == "complete", "a JSON result without resultType gets complete")
+    check(json:find('"content":%[%]') ~= nil, "an empty content array stays an array")
+
+    local sse = M._with_modern_result_fields('event: message\ndata: {"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"x"}]}}\n\n', "tools/call")
+    local data = sse:match("data: ([^\n]+)")
+    check(cjson.decode(data).result.resultType == "complete", "an SSE data line gets resultType")
+    check(sse:sub(1, 15) == "event: message\n" and sse:sub(-2) == "\n\n", "the SSE framing is kept")
+
+    local kept = '{"jsonrpc":"2.0","id":5,"result":{"resultType":"input_required","inputRequests":{}}}'
+    check(M._with_modern_result_fields(kept, "tools/call") == kept, "an existing resultType is left alone")
+
+    local err = '{"jsonrpc":"2.0","id":6,"error":{"code":-32602,"message":"bad"}}'
+    check(M._with_modern_result_fields(err, "tools/call") == err, "an error response is unchanged")
+    check(M._with_modern_result_fields("not json", "tools/call") == "not json", "a body that is not JSON is unchanged")
+end
+
+-- ---------------------------------------------------------------------------
+print("forwarded reads and router lists carry the 2026-07-28 cache fields")
+do
+    local read = M._with_modern_result_fields(
+        '{"jsonrpc":"2.0","id":8,"result":{"contents":[{"uri":"file:///a","text":"x"}]}}',
+        "resources/read")
+    local r = cjson.decode(read).result
+    check(r.resultType == "complete" and r.cacheScope == "private" and r.ttlMs == 0,
+        "a forwarded resources/read gains resultType, cacheScope private and ttlMs 0")
+
+    local own = '{"jsonrpc":"2.0","id":9,"result":{"contents":[],"resultType":"complete",'
+        .. '"cacheScope":"public","ttlMs":5000}}'
+    check(M._with_modern_result_fields(own, "resources/read") == own,
+        "a read that already has all three fields is left alone")
+
+    local call = cjson.decode(M._with_modern_result_fields(
+        '{"jsonrpc":"2.0","id":10,"result":{"content":[]}}', "tools/call")).result
+    check(call.resultType == "complete" and call.cacheScope == nil and call.ttlMs == nil,
+        "a tools/call result gets resultType only (not a cacheable method)")
+end
+
+print("unknown tools answer -32602 for 2026-07-28 clients and -32601 otherwise")
+do
+    local mapping = { tools = {}, tool_backend_map = {}, required_scopes = {} }
+    for _, case in ipairs({ { modern = true, code = -32602 }, { modern = false, code = -32601 } }) do
+        ngx.ctx.vr_modern_client = case.modern
+        ngx._last_body = nil
+        M._handle_tools_call(1, mapping, { name = "missing_tool", arguments = {} }, "", "vs-1", "srv")
+        local body = cjson.decode(ngx._last_body or "{}")
+        check(body.error and body.error.code == case.code,
+            "unknown tool code is " .. case.code .. " when modern=" .. tostring(case.modern))
+    end
+    ngx.ctx.vr_modern_client = nil
 end
 
 -- ---------------------------------------------------------------------------

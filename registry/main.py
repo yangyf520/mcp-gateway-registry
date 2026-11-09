@@ -71,6 +71,7 @@ from registry.auth.dependencies import (
 from registry.auth.routes import router as auth_router
 
 # Import core configuration
+from registry.core.aws_credential_posture import log_aws_credential_posture
 from registry.core.config import (
     InternalDeploymentType,
     RegistryMode,
@@ -78,6 +79,7 @@ from registry.core.config import (
     _validate_mode_combination,
     log_tab_visibility_warnings,
     print_a2a_reverse_proxy_mode_banner,
+    print_embeddings_extra_headers_inert_banner,
     settings,
 )
 from registry.core.metrics import DEPLOYMENT_MODE_INFO
@@ -99,6 +101,9 @@ from registry.repositories.factory import get_search_repository
 from registry.services.agent_service import agent_service
 from registry.services.peer_federation_service import get_peer_federation_service
 from registry.services.peer_sync_scheduler import get_peer_sync_scheduler
+from registry.services.scanner_llm_analyzer import (
+    print_llm_analyzer_unavailable_banner,
+)
 
 # Import services for initialization
 from registry.services.server_service import server_service
@@ -455,6 +460,31 @@ async def _apply_aws_registry_env_vars() -> None:
     logger.info(f"Federation config updated: aws_registry.enabled={enabled}")
 
 
+def _is_aws_federation_enabled(
+    federation_config: Any,
+) -> bool:
+    """Report whether AgentCore registry federation is on.
+
+    Args:
+        federation_config: The loaded ``FederationConfig``, or ``None`` when the
+            config could not be read.
+
+    Returns:
+        ``True`` only when the config loaded and the flag is set. An unreadable
+        config counts as enabled, so the credential warning stays quiet rather
+        than telling an operator to detach a profile a federation they cannot
+        confirm may need.
+    """
+    if federation_config is None:
+        return True
+
+    aws_registry = getattr(federation_config, "aws_registry", None)
+    if aws_registry is None:
+        return True
+
+    return bool(getattr(aws_registry, "enabled", True))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application startup and shutdown lifecycle management."""
@@ -488,6 +518,14 @@ async def lifespan(app: FastAPI):
     # deployment mode force-disables it (registry-only). Called after mode
     # correction so it reflects the effective deployment_mode.
     print_a2a_reverse_proxy_mode_banner(settings)
+    print_embeddings_extra_headers_inert_banner(settings)
+    print_llm_analyzer_unavailable_banner(
+        {
+            "SECURITY_ANALYZERS": settings.security_analyzers,
+            "AGENT_SECURITY_ANALYZERS": settings.agent_security_analyzers,
+            "SKILL_SECURITY_ANALYZERS": settings.skill_security_analyzers,
+        }
+    )
 
     # Log startup configuration
     _log_startup_configuration()
@@ -606,6 +644,10 @@ async def lifespan(app: FastAPI):
                 f"Failed to apply AWS Registry env vars (continuing with startup): {e}",
                 exc_info=True,
             )
+
+        # Bound before the try so the AWS credential check below can read it even
+        # if loading the config raises.
+        federation_config = None
 
         try:
             # Load federation config
@@ -780,6 +822,13 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error(f"Failed to load federation config: {e}")
             logger.info("Continuing without federation")
+
+        # Issue #1861: say which AWS identity this process runs as, and warn when
+        # it can reach instance-metadata credentials no enabled feature needs.
+        # Runs after the federation config load so the AgentCore flag is known.
+        await log_aws_credential_posture(
+            aws_federation_enabled=_is_aws_federation_enabled(federation_config),
+        )
 
         logger.info("Initializing peer federation service...")
         peer_federation_service = get_peer_federation_service()

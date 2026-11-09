@@ -17,6 +17,8 @@ import time
 import jwt as pyjwt
 from fastapi import HTTPException, Request, status
 
+from registry.auth.resource_binding import MCP_TRANSPORT_SEGMENTS, mcp_proxy_route_binding
+
 logger = logging.getLogger(__name__)
 
 # Reuse the existing internal issuer (matches registry/auth/internal.py).
@@ -33,6 +35,26 @@ MCP_PROXY_TOKEN_USE: str = "mcp-proxy"
 # replayed as an mcp-proxy token, a service token, or vice-versa.
 MCP_REGISTRY_UI_AUDIENCE: str = "mcp-registry-ui"
 MCP_REGISTRY_UI_TOKEN_USE: str = "mcp-registry-ui"
+
+# Ceiling on every internal token /validate mints. nginx reads the /validate
+# response that carries these tokens into the 64 KiB proxy_buffer_size of
+# ``location = /validate`` (issue #1939); 40 KiB leaves 20 KiB of
+# ``VALIDATE_RESPONSE_HEADER_BUDGET`` for the other auth headers. A bearer's
+# inline groups stay under it, because nginx caps one inbound header at 32 KiB
+# and re-encoding those groups yields a token near 32 KiB at most. Nothing else
+# bounds the groups that come from server-side sources:
+# ``REGISTRY_API_KEYS`` entries, the MongoDB ``idp_m2m_clients`` and
+# ``idp_user_groups`` enrichment, or a large scope catalog in the scopes claim.
+INTERNAL_TOKEN_MAX_BYTES: int = 40 * 1024
+
+# Ceiling on the headers of a whole /validate response, which nginx reads into the
+# same 64 KiB buffer; a larger response is an opaque "upstream sent too big header"
+# 500 there. Each token is capped above, but X-Scopes and the tokens together could
+# still exceed the buffer, so ``server._enforce_validate_header_budget`` checks the
+# total. 60 KiB leaves room for the status line and the headers the ASGI server
+# adds. The nginx template tests assert every ``location = /validate`` buffer
+# exceeds it.
+VALIDATE_RESPONSE_HEADER_BUDGET: int = 60 * 1024
 
 # Audience for the generic reverse-proxy hop (/proxy/{entity_type}/{path}), used
 # for non-MCP proxied entities (skills, agents, custom). Distinct from every
@@ -94,6 +116,16 @@ def _leeway_seconds() -> int:
         return 5
 
 
+class InternalTokenTooLargeError(RuntimeError):
+    """A minted internal token is too large to carry through nginx's /validate buffer.
+
+    Distinct from the ``ValueError`` an empty subject raises: that one means "no
+    token for this caller" and /validate still answers 200, while this one is a
+    server-side configuration limit that /validate reports as a 500 so it is not
+    mistaken for a credential failure.
+    """
+
+
 def _get_secret_key() -> str:
     secret_key = os.environ.get("SECRET_KEY")
     if not secret_key:
@@ -123,6 +155,10 @@ def _mint_internal_token(
 
     Raises:
         ValueError: If ``SECRET_KEY`` is unset or ``subject`` is empty.
+        InternalTokenTooLargeError: If the encoded token exceeds
+            ``INTERNAL_TOKEN_MAX_BYTES``. An oversized token would overflow nginx's
+            /validate header buffer, so refusing here fails closed with a clear log
+            line instead of an opaque nginx 500.
     """
     if not subject:
         # An empty subject would mint an anonymous-but-valid token. Refuse, so
@@ -143,7 +179,16 @@ def _mint_internal_token(
     # a reserved base claim (aud/exp/iss/sub/...). Callers pass server-derived
     # constants today, but this makes the invariant structural, not a convention.
     claims: dict = {**(extra_claims or {}), **base_claims}
-    return pyjwt.encode(claims, secret_key, algorithm="HS256")
+    token = pyjwt.encode(claims, secret_key, algorithm="HS256")
+    if len(token) > INTERNAL_TOKEN_MAX_BYTES:
+        groups = claims.get("groups")
+        raise InternalTokenTooLargeError(
+            f"{audience} token is {len(token)} bytes ({len(claims['scopes'])} scopes, "
+            f"{len(groups) if isinstance(groups, list) else 0} groups), over the "
+            f"{INTERNAL_TOKEN_MAX_BYTES}-byte limit; reduce this identity's groups or "
+            "scopes (map fewer IdP groups, or trim the REGISTRY_API_KEYS entry)"
+        )
+    return token
 
 
 def _decode_internal_token(
@@ -182,13 +227,15 @@ def mint_mcp_proxy_token(
     auth_method: str = "",
     egress_user: str = "",
     audit_identity: dict | None = None,
+    version_id: str = "",
+    virtual_backend: bool = False,
+    obo_subject_sha256: str = "",
 ) -> str:
     """Mint the per-request /mcp-proxy token in /validate's 200 path.
 
-    ``upstream_url`` is the resolved upstream **before** mcp_proxy's sub-path
-    append; mcp_proxy applies the append itself so the bound claim and /validate's
-    view agree exactly. ``server`` is the first path segment, used as a
-    path-traversal guard by the verifier.
+    ``upstream_url`` is the selected outbound destination. ``server`` is the
+    already-resolved registered server path, including any legitimate trailing
+    transport-named component (e.g. ``peer/mcp``).
 
     ``auth_method`` is the CANONICAL egress principal method (see
     ``EgressAuthService.canonical_auth_method``): the per-user egress vault keys
@@ -217,16 +264,37 @@ def mint_mcp_proxy_token(
     (``server._audit_identity_from_token``) already degrades an absent claim to
     the verified ``sub`` principal. Chosen over deleting the guard, which would
     sign ``"audit_identity": null`` on those paths.
+
+    ``obo_subject_sha256`` is the SHA-256 hex digest of the bearer JWT that
+    /validate verified with the configured OBO-capable IdP. The mcp-proxy hop
+    serves an OBO token from its cache only when the subject token it holds
+    hashes to this value: on a cookie-authenticated request /validate never
+    verifies the bearer header, and a cache hit skips the IdP exchange that would
+    otherwise reject a forged or expired assertion. Omitted when empty (cookie,
+    self-signed, static-credential and non-OBO-IdP callers), which disables the
+    cache for that request.
+
+    Raises:
+        ValueError: The subject is empty or ``SECRET_KEY`` is unset.
+        InternalTokenTooLargeError: The minted token exceeds
+            ``INTERNAL_TOKEN_MAX_BYTES`` (see ``_mint_internal_token``).
     """
+    registered_server = server_name.strip("/")
+    if not registered_server:
+        raise ValueError("registered server path is required")
     extra_claims: dict = {
-        "server": server_name.split("/", 1)[0] if server_name else "",
+        "server": registered_server,
         "upstream_url": upstream_url,
+        "version_id": version_id,
+        "virtual_backend": virtual_backend,
         "auth_method": auth_method,
         "egress_user": egress_user or "",
         "token_use": MCP_PROXY_TOKEN_USE,
     }
     if audit_identity:
         extra_claims["audit_identity"] = audit_identity
+    if obo_subject_sha256:
+        extra_claims["obo_subject_sha256"] = obo_subject_sha256
     return _mint_internal_token(
         audience=MCP_PROXY_AUDIENCE,
         subject=subject,
@@ -272,6 +340,11 @@ def mint_generic_proxy_token(
     ``has_upstream_auth`` binds whether the entity has registered upstream auth
     headers, so the hop vends + injects them (from the registry's internal
     endpoint) only on the signed claim.
+
+    Raises:
+        ValueError: The subject is empty or ``SECRET_KEY`` is unset.
+        InternalTokenTooLargeError: The minted token exceeds
+            ``INTERNAL_TOKEN_MAX_BYTES`` (see ``_mint_internal_token``).
     """
     method = http_method.strip().upper()
     if not method:
@@ -311,14 +384,14 @@ def mint_registry_ui_token(
 
     A thin identity assertion: it binds *who* the caller is, NOT their resolved
     entitlements. The registry derives groups->scopes->permissions server-side
-    (mirroring its cookie path), so no scopes are encoded and the token stays a
-    constant size regardless of group count.
+    (mirroring its cookie path), so no scopes are encoded.
 
     ``session_id`` is the opaque server-side session identifier for browser/
     session-backed callers (the registry resolves live groups via the session
     store); it is empty for bearer/IdP-JWT and static-token callers, which have
     no session row and instead rely on the ``groups`` claim. ``groups`` is the
-    fallback for those non-session callers (small, machine-identity group sets).
+    fallback for those non-session callers, so the token grows with their group
+    count.
 
     ``egress_user`` is the CANONICAL per-user egress vault id (OIDC ``sub``). The
     registry's consent-write path keys the vault on this; it must match the value
@@ -327,6 +400,11 @@ def mint_registry_ui_token(
     ``_mint_internal_token`` refuses an empty subject (fail-closed): if minting
     raises, /validate attaches no token and the registry rejects the request
     rather than trusting unsigned headers.
+
+    Raises:
+        ValueError: The subject is empty.
+        InternalTokenTooLargeError: The minted token exceeds
+            ``INTERNAL_TOKEN_MAX_BYTES`` (see ``_mint_internal_token``).
     """
     return _mint_internal_token(
         audience=MCP_REGISTRY_UI_AUDIENCE,
@@ -387,15 +465,68 @@ async def verify_mcp_proxy_token(request: Request) -> None:
             status.HTTP_401_UNAUTHORIZED, detail="Internal proxy token missing upstream"
         )
 
-    # Path-traversal guard: the bound server must match the route's first segment.
-    path_server = (request.path_params.get("server_name") or "").split("/", 1)[0]
-    if claims.get("server") != path_server:
+    path_server = (request.path_params.get("server_name") or "").strip("/")
+    route_mode = request.headers.get("X-Registered-Route-Mode")
+    registered_header = request.headers.get("X-Registered-Server-Path")
+    reason = _mcp_proxy_route_mismatch(claims, path_server, route_mode, registered_header)
+    if reason:
+        # Name the failed check and the route: version skew during a rolling
+        # deploy and a forged route look alike from the status code alone.
         logger.warning(
-            f"mcp_proxy: server claim/path mismatch (claim={claims.get('server')!r} path={path_server!r})"
+            "mcp_proxy: rejecting proxy route (%s): claim=%r path=%r route_mode=%r "
+            "registered_header=%r",
+            reason,
+            claims.get("server"),
+            path_server,
+            route_mode,
+            registered_header,
         )
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="Server claim/path mismatch")
 
     request.state.mcp_proxy_claims = claims
+
+
+def _mcp_proxy_route_mismatch(
+    claims: dict,
+    path_server: str,
+    route_mode: str | None,
+    registered_header: str | None,
+) -> str | None:
+    """Why the signed registration does not match the nginx proxy route, or None.
+
+    The signed route mode disambiguates a registered name ending in /mcp from a
+    direct transport suffix; the registered name is never stripped again.
+
+    Two pre-upgrade shapes are accepted, both as direct routes, so auth-server
+    and nginx can be rolled independently: a token without route-binding claims
+    (minted by an older auth-server replica, see ``mcp_proxy_route_binding``) and
+    a hop without the nginx-forced registration headers (an older nginx, which
+    only ever generated direct locations). A virtual route always requires both
+    the claim and the headers.
+    """
+    registered_server = claims.get("server")
+    if not isinstance(registered_server, str) or not registered_server:
+        return "missing server claim"
+    binding = mcp_proxy_route_binding(claims)
+    if binding is None:
+        return "malformed or invalid version binding"
+    _, virtual_backend = binding
+    if route_mode is None and registered_header is None:
+        if virtual_backend:
+            return "virtual token without nginx registration headers"
+    elif route_mode != ("virtual" if virtual_backend else "direct"):
+        return "route mode differs from the signed binding"
+    elif registered_header != "/" + registered_server:
+        return "registered path header differs from the server claim"
+    if path_server == registered_server:
+        return None
+    if (
+        virtual_backend
+        or path_server.rsplit("/", 1)[-1] not in MCP_TRANSPORT_SEGMENTS
+        or path_server.rsplit("/", 1)[0] != registered_server
+    ):
+        return "proxy path differs from the server claim"
+    return None
 
 
 def _norm_path(value: str) -> str:

@@ -37,6 +37,15 @@ def _internal_auth_headers() -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
+def _virtual_auth_location_headers(marker: str, registered_path: str = "/github") -> dict:
+    """Headers a current generated /_vs_auth_* location force-sets on /validate."""
+    return {
+        "X-Validate-Binding-Secret": marker,
+        "X-Registered-Server-Path": registered_path,
+        "X-Registered-Route-Mode": "virtual",
+    }
+
+
 def _mint_self_signed(
     secret_key: str,
     *,
@@ -184,6 +193,116 @@ class TestMintResourceBoundToken:
         assert claims["egress_user"] == "oidc-sub-uuid"
         assert claims["sub"] == "alice"
 
+    def test_graph_confirmed_empty_session_token_keeps_empty_groups(self, auth_env_vars):
+        import asyncio
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        from fastapi.testclient import TestClient
+
+        import auth_server.server as server_module
+        from auth_server.mongodb_groups_enrichment import should_enrich_user_groups
+        from registry.auth.dependencies import _context_from_internal_token
+        from registry.auth.proxied_token import verify_registry_ui_token
+
+        server_module.user_token_generation_counts.clear()
+        session = {
+            "username": "alice",
+            "provider": "entra",
+            "groups": [],
+            "entra_graph_groups_resolved": True,
+            "subject": "oidc-sub-alice",
+        }
+        body = {
+            "user_context": {
+                "username": "alice",
+                "groups": [],
+                "scopes": [],
+                "auth_method": "oauth2",
+                "provider": "entra",
+                "session_id": "s1",
+            },
+            "requested_scopes": [],
+            "expires_in_hours": 1,
+        }
+        with (
+            patch("session_store.resolve_session", AsyncMock(return_value=session)),
+            patch.object(server_module, "IDP_USER_GROUP_FALLBACK_ENABLED_PROVIDERS", ["entra"]),
+            patch(
+                "mongodb_groups_enrichment.should_enrich_user_groups",
+                wraps=should_enrich_user_groups,
+            ),
+            patch(
+                "mongodb_groups_enrichment.enrich_user_groups_from_mongodb",
+                AsyncMock(return_value=["stale-admin"]),
+            ) as fallback,
+            patch(
+                "registry.repositories.factory.get_scope_repository",
+                return_value=AsyncMock(
+                    get_all_group_mappings=AsyncMock(
+                        return_value={"mcp-registry-admin": ["stale-admin"]}
+                    ),
+                    get_server_scopes_bulk=AsyncMock(return_value={}),
+                    get_ui_scopes_bulk=AsyncMock(return_value={}),
+                ),
+            ),
+        ):
+            client = TestClient(server_module.app)
+            minted = client.post("/internal/tokens", json=body, headers=_internal_auth_headers())
+            assert minted.status_code == 200, minted.text
+            token = minted.json()["access_token"]
+            validated = client.get(
+                "/validate",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "X-Original-URL": "https://example.com/api/servers",
+                    "X-Registry-Api-Auth": "1",
+                    "X-Validate-Source-Secret": server_module.settings.auth_server_nginx_marker_secret,
+                },
+            )
+
+            internal_token = validated.headers["X-Internal-Token-Registry"]
+            claims = verify_registry_ui_token(internal_token)
+            request = SimpleNamespace(state=SimpleNamespace())
+            context = asyncio.run(_context_from_internal_token(request, internal_token))
+        assert validated.status_code == 200, validated.text
+        assert validated.json()["groups"] == []
+        assert claims["groups"] == []
+        assert context["groups"] == []
+        assert context["scopes"] == []
+        assert context["is_admin"] is False
+        fallback.assert_not_awaited()
+
+    def test_unbacked_mint_cannot_assert_graph_group_provenance(self, auth_env_vars):
+        from fastapi.testclient import TestClient
+
+        import auth_server.server as server_module
+
+        server_module.user_token_generation_counts.clear()
+        body = {
+            "user_context": {
+                "username": "alice",
+                "groups": [],
+                "scopes": [],
+                "auth_method": "oauth2",
+                "provider": "entra",
+                "entra_graph_groups_resolved": True,
+            },
+            "requested_scopes": [],
+            "expires_in_hours": 1,
+        }
+        minted = TestClient(server_module.app).post(
+            "/internal/tokens", json=body, headers=_internal_auth_headers()
+        )
+        assert minted.status_code == 200, minted.text
+        claims = jwt.decode(
+            minted.json()["access_token"],
+            server_module.SECRET_KEY,
+            algorithms=["HS256"],
+            audience="mcp-registry",
+        )
+        assert "entra_graph_groups_resolved" not in claims
+
     def test_resource_token_has_claims(self, auth_env_vars):
         response, secret = self._mint(
             resource={"type": "server", "id": "/cloudflare-docs"},
@@ -205,11 +324,12 @@ class TestMintResourceBoundToken:
         assert response.status_code == 422  # Pydantic validation
 
     def test_resource_token_accepts_all_four_types(self, auth_env_vars):
-        for rtype, rid in [
-            ("server", "cloudflare-docs"),
-            ("virtual_server", "virtual/my-agg"),
-            ("agent", "code-reviewer"),
-            ("skill", "python-linter"),
+        for rtype, rid, expected in [
+            ("server", "cloudflare-docs", "cloudflare-docs"),
+            ("virtual_server", "virtual/my-agg", "virtual/my-agg"),
+            ("agent", "code-reviewer", "code-reviewer"),
+            ("skill", "python-linter", "skills/python-linter"),
+            ("skill", "/skills/python-linter", "skills/python-linter"),
         ]:
             response, secret = self._mint(
                 resource={"type": rtype, "id": rid},
@@ -224,7 +344,7 @@ class TestMintResourceBoundToken:
             )
             assert claims["token_kind"] == "resource"
             assert claims["resource_type"] == rtype
-            assert claims["resource_id"] == rid
+            assert claims["resource_id"] == expected
 
 
 class TestLegacyTokenWarningScoping:
@@ -297,9 +417,14 @@ class TestValidateEdgeEnforcement:
         ``auth_env_vars`` would try to reach JWKS in the real Cognito
         service, which is not what these tests are exercising.
         """
+        from auth_server.providers.base import AuthProvider
+
         validator = module.SimplifiedCognitoValidator()
 
         class _SelfSignedOnlyProvider:
+            recover_bearer_groups = AuthProvider.recover_bearer_groups
+            is_delegated_user = AuthProvider.is_delegated_user
+
             def validate_token(self, token: str) -> dict:
                 return validator.validate_self_signed_token(token)
 
@@ -413,6 +538,187 @@ class TestValidateEdgeEnforcement:
                 },
             )
         assert response.status_code == 403, response.text
+
+    @pytest.mark.parametrize(
+        ("parent", "backend", "grant", "marker", "current_nginx", "expected"),
+        [
+            ("/virtual/test1/mcp", "/github/mcp", True, "verified-marker-for-test", True, 200),
+            ("/virtual/other/mcp", "/github/mcp", True, "verified-marker-for-test", True, 403),
+            ("/virtual/test1/mcp", "/github/mcp", False, "verified-marker-for-test", True, 403),
+            ("/api/admin/config", "/github/mcp", True, "verified-marker-for-test", True, 403),
+            ("/virtual/test1/mcp", "/github/mcp", True, "", True, 403),
+            ("/virtual/test1/mcp", "/github/mcp", True, "wrong-marker", True, 403),
+            ("", "/github/mcp", True, "verified-marker-for-test", True, 403),
+            ("/virtual/test1/mcp", "/other/mcp", True, "verified-marker-for-test", True, 403),
+            # An older nginx forwards the marker but passes the client's own
+            # X-Virtual-Original-URL through: never a virtual binding.
+            ("/virtual/test1/mcp", "/github/mcp", True, "verified-marker-for-test", False, 403),
+        ],
+    )
+    def test_virtual_bound_token_backend_requires_parent_binding_and_backend_grant(
+        self, auth_env_vars, parent, backend, grant, marker, current_nginx, expected
+    ):
+        """The internal backing check cannot widen a virtual-bound token."""
+        from unittest.mock import AsyncMock
+
+        client, secret, module = self._client_and_secret(auth_env_vars)
+        token = _mint_self_signed(
+            secret,
+            token_kind="resource",
+            resource_type="virtual_server",
+            resource_id="virtual/test1",
+            scope="virtual-only backend-only",
+        )
+        repo = AsyncMock()
+        repo.get_server_scopes.side_effect = (
+            lambda scope: [
+                {"server": "virtual/test1", "methods": ["tools/list"], "tools": ["get_me"]}
+            ]
+            if scope == "virtual-only"
+            else [{"server": "github", "methods": ["tools/list"], "tools": ["get_me"]}]
+            if grant
+            else []
+        )
+        with (
+            patch("auth_server.server.get_scope_repository", return_value=repo),
+            patch("auth_server.server.get_auth_provider", return_value=self._make_provider(module)),
+            patch.object(
+                module.settings, "auth_server_nginx_marker_secret", "verified-marker-for-test"
+            ),
+        ):
+            response = client.get(
+                "/validate",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "X-Original-URL": "https://example.com" + backend,
+                    "X-Body": '{"jsonrpc":"2.0","id":1,"method":"tools/list"}',
+                    "X-Virtual-Original-URL": "https://example.com" + parent,
+                    "X-Resolved-Upstream": "https://api.githubcopilot.com/mcp",
+                    "X-Validate-Source-Secret": marker,
+                    **(_virtual_auth_location_headers(marker) if current_nginx else {}),
+                },
+            )
+        assert response.status_code == expected
+
+    @pytest.mark.parametrize(("tool", "expected"), [("get_me", 200), ("delete_repo", 403)])
+    def test_virtual_bound_token_checks_rewritten_backend_tool(self, auth_env_vars, tool, expected):
+        """Virtual binding cannot authorize an ungranted backing tool."""
+        from unittest.mock import AsyncMock
+
+        client, secret, module = self._client_and_secret(auth_env_vars)
+        token = _mint_self_signed(
+            secret,
+            token_kind="resource",
+            resource_type="virtual_server",
+            resource_id="virtual/test1",
+            scope="backend-only",
+        )
+        repo = AsyncMock()
+        repo.get_server_scopes.return_value = [
+            {"server": "github", "methods": ["tools/call"], "tools": ["get_me"]}
+        ]
+        with (
+            patch("auth_server.server.get_scope_repository", return_value=repo),
+            patch("auth_server.server.get_auth_provider", return_value=self._make_provider(module)),
+            patch.object(
+                module.settings, "auth_server_nginx_marker_secret", "verified-marker-for-test"
+            ),
+            patch(
+                "auth_server.server._get_blocked_tools", new_callable=AsyncMock, return_value=set()
+            ),
+        ):
+            response = client.get(
+                "/validate",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "X-Original-URL": "https://example.com/github/mcp",
+                    "X-Body": f'{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{tool}"}}}}',
+                    "X-Virtual-Original-URL": "https://example.com/virtual/test1/mcp",
+                    "X-Resolved-Upstream": "https://api.githubcopilot.com/mcp",
+                    "X-Validate-Source-Secret": "verified-marker-for-test",
+                    **_virtual_auth_location_headers("verified-marker-for-test"),
+                },
+            )
+        assert response.status_code == expected
+
+    @pytest.mark.parametrize(
+        ("token_audience", "current_nginx", "expected"),
+        [
+            # Entra issues the ingress token for the VIRTUAL server's resource;
+            # the backing-grant hop must accept it for that parent.
+            ("https://example.com/virtual/test1/mcp", True, 200),
+            # A token for another virtual server never passes this parent's hop.
+            ("https://example.com/virtual/other/mcp", True, 401),
+            # Without the binding-secret registration headers the parent URL
+            # is untrusted, so its audience is not accepted.
+            ("https://example.com/virtual/test1/mcp", False, 401),
+        ],
+    )
+    def test_idp_token_backend_hop_accepts_parent_virtual_audience(
+        self, auth_env_vars, token_audience, current_nginx, expected
+    ):
+        """An Entra-style per-server token passes the backing hop of its own parent."""
+        from unittest.mock import AsyncMock
+
+        client, _, module = self._client_and_secret(auth_env_vars)
+
+        from auth_server.providers.base import AuthProvider
+
+        class _AudienceCheckingProvider:
+            """Accept the token only for its expected audience, like Entra."""
+
+            recover_bearer_groups = AuthProvider.recover_bearer_groups
+            is_delegated_user = AuthProvider.is_delegated_user
+
+            def validate_token(self, token: str, extra_audiences=None) -> dict:
+                if token_audience not in (extra_audiences or []):
+                    raise ValueError("Invalid token - Audience doesn't match")
+                return {
+                    "valid": True,
+                    "username": "alice@example.com",
+                    "groups": ["backend-group"],
+                    "scopes": [],
+                    "client_id": "ide-client",
+                    "method": "entra",
+                    "data": {"aud": token_audience},
+                }
+
+            def get_provider_info(self) -> dict:
+                return {"provider_type": "entra"}
+
+        repo = AsyncMock()
+        repo.get_group_mappings_bulk.return_value = ["backend-only"]
+        repo.get_server_scopes.return_value = [
+            {"server": "github", "methods": ["tools/list"], "tools": ["get_me"]}
+        ]
+        with (
+            patch("auth_server.server.get_scope_repository", return_value=repo),
+            patch("auth_server.server.get_auth_provider", return_value=_AudienceCheckingProvider()),
+            patch.object(
+                module.settings, "auth_server_nginx_marker_secret", "verified-marker-for-test"
+            ),
+            patch.dict(
+                "os.environ",
+                {"AUTH_PROVIDER": "entra", "AUTH_SERVER_EXTERNAL_URL": "https://example.com"},
+            ),
+        ):
+            response = client.get(
+                "/validate",
+                headers={
+                    "Authorization": "Bearer opaque-idp-token",
+                    "X-Original-URL": "https://example.com/github/mcp",
+                    "X-Body": '{"jsonrpc":"2.0","id":1,"method":"tools/list"}',
+                    "X-Virtual-Original-URL": "https://example.com/virtual/test1/mcp",
+                    "X-Resolved-Upstream": "https://api.githubcopilot.com/mcp",
+                    "X-Validate-Source-Secret": "verified-marker-for-test",
+                    **(
+                        _virtual_auth_location_headers("verified-marker-for-test")
+                        if current_nginx
+                        else {}
+                    ),
+                },
+            )
+        assert response.status_code == expected, response.text
 
     def test_resource_token_on_tokens_generate_blocked(
         self, auth_env_vars, mock_scope_repository_with_data
@@ -563,7 +869,12 @@ class TestValidateEdgeEnforcement:
             "data": {"cognito:username": "alice", "sub": "alice"},
         }
 
+        from auth_server.providers.base import AuthProvider
+
         class _ExternalProvider:
+            recover_bearer_groups = AuthProvider.recover_bearer_groups
+            is_delegated_user = AuthProvider.is_delegated_user
+
             def validate_token(self, _token):
                 return validation_result
 
